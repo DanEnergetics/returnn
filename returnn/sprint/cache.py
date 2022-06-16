@@ -507,6 +507,7 @@ class FileArchiveBundle:
     self.archives = {}  # type: typing.Dict[str,FileArchive]
     # archive content file -> FileArchive
     self.files = {}  # type: typing.Dict[str,FileArchive]
+    self.ft = {} # type: typing.Dict[str,...]
     self._short_seg_names = {}
     if filename is not None:
       self.add_bundle(filename=filename)
@@ -525,6 +526,7 @@ class FileArchiveBundle:
     if filename in self.archives:
       return
     self.archives[filename] = a = FileArchive(filename, must_exists=True)
+    self.ft.update(a.ft)
     for f in a.ft.keys():
       self.files[f] = a
     # noinspection PyProtectedMember

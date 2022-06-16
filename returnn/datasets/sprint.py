@@ -1110,6 +1110,10 @@ class SprintCacheDataset(CachedDataset2):
     self.num_outputs = {key: (d.num_labels, d.num_dims) for (key, d) in self.data.items()}
     self.num_inputs = self.num_outputs["data"][0]
     self._seq_lens = None
+  
+  @property
+  def num_seqs(self):
+    return len(self.seq_list_original)
 
   def _check_matching_content_list(self):
     data0 = self.data["data"]
@@ -1147,7 +1151,12 @@ class SprintCacheDataset(CachedDataset2):
       :param int s:
       :rtype: int
       """
-      return data0.sprint_cache.ft[self.seq_list_original[s]].size
+      seq_tag = self.seq_list_original[s]
+      try:
+        return data0.sprint_cache.ft[seq_tag].size
+      except AttributeError:
+        # sprint_cache is FileArchiveBundle
+        return data0.sprint_cache.files[seq_tag].ft[seq_tag].size
     seq_index = self.get_seq_order_for_epoch(epoch, self.num_seqs, get_seq_len=get_seq_size)
     self.seq_list_ordered = [self.seq_list_original[s] for s in seq_index]
     return True
