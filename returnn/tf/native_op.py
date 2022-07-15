@@ -1253,7 +1253,10 @@ def fast_baum_welch(am_scores, edges, weights, start_end_states, float_idx, stat
   float_idx = tf.cast(float_idx, tf.float32)
   if state_buffer is None:
     last_state_idx = tf.reduce_max(start_end_states[1])  # see get_automata_for_batch
-    state_buffer = tf.zeros((2, last_state_idx + 1))
+    with tf.control_dependencies([
+        tf_compat.v1.assert_greater_equal(
+          last_state_idx, 0, data=["last_state_idx must be >= 0 but is:", last_state_idx])]):
+      state_buffer = tf.zeros((2, last_state_idx + 1))
   fwdbwd, obs_scores = op(am_scores, edges, weights, start_end_states, float_idx, state_buffer)  # noqa
   return fwdbwd, obs_scores
 
@@ -1333,11 +1336,19 @@ def get_ctc_fsa_fast_bw(targets, seq_lens, blank_idx, label_loop=True):
   targets = tf.cast(targets, tf.int32)
   n_batch = targets_shape[0]
   n_time = targets_shape[1]
-  n_edges = n_batch * (5 * (n_time - 1) + 10)  # see op documentation
-  weights = tf.zeros((n_edges,))
-  maker = OpMaker(OpDescription.from_gen_base(native_op.GetCtcFsaFastBwOp))
-  op = maker.make_op()
-  edges, start_end_states = op(targets, seq_lens, blank_idx, weights, label_loop)
+  with tf.control_dependencies([
+      # The check on the seq lens is important
+      # because invalid seq lens might not directly lead to an error here
+      # but it might just return an invalid FSA.
+      # An invalid FSA can however later cause a crash in the FastBaumWelchOp.
+      tf_compat.v1.assert_equal(
+        tf.reduce_max(seq_lens), n_time,
+        data=["get_ctc_fsa_fast_bw seq_lens invalid", seq_lens, n_time, targets_shape], summarize=100)]):
+    n_edges = n_batch * (5 * (n_time - 1) + 10)  # see op documentation
+    weights = tf.zeros((n_edges,))
+    maker = OpMaker(OpDescription.from_gen_base(native_op.GetCtcFsaFastBwOp))
+    op = maker.make_op()
+    edges, start_end_states = op(targets, seq_lens, blank_idx, weights, label_loop)
   return edges, weights, start_end_states
 
 
@@ -1357,7 +1368,8 @@ def fast_baum_welch_staircase(am_scores, seq_lens, **opts):
 
 
 def ctc_loss(logits, logits_seq_lens, logits_time_major, targets, targets_seq_lens,
-             ctc_merge_repeated=True, logits_normalize=True, grad_wrt_softmax_in=True):
+             ctc_merge_repeated=True, logits_normalize=True, grad_wrt_softmax_in=True,
+             blank_index=-1):
   """
   Similar to :func:`tf.nn.ctc_loss`.
   We use our :func:`fast_baum_welch`.
@@ -1375,6 +1387,7 @@ def ctc_loss(logits, logits_seq_lens, logits_time_major, targets, targets_seq_le
     This is ``p(s|x) - bw``, where ``bw`` is the Baum-Welch soft alignment.
     If logits are already normalized (e.g. we just use ``log p(s|x) = logits``),
     the error signal to logits should be ``-bw``.
+  :param int blank_index:
   :return: loss, shape (batch,)
   :rtype: tf.Tensor
   """
@@ -1389,8 +1402,11 @@ def ctc_loss(logits, logits_seq_lens, logits_time_major, targets, targets_seq_le
   from returnn.tf.util.basic import sequence_mask_time_major, where_bc
   seq_mask = sequence_mask_time_major(logits_seq_lens)  # (time,batch)
 
+  if blank_index < 0:
+    blank_index += dim
+  assert 0 <= blank_index < dim
   edges, weights, start_end_states = get_ctc_fsa_fast_bw(
-    targets=targets, seq_lens=targets_seq_lens, blank_idx=dim - 1, label_loop=ctc_merge_repeated)
+    targets=targets, seq_lens=targets_seq_lens, blank_idx=blank_index, label_loop=ctc_merge_repeated)
   fwdbwd, obs_scores = fast_baum_welch(
     am_scores=-log_sm, float_idx=seq_mask,
     edges=edges, weights=weights, start_end_states=start_end_states)
@@ -1427,7 +1443,7 @@ def fast_viterbi(am_scores, am_seq_len, edges, weights, start_end_states):
   return alignment, scores
 
 
-def ctc_loss_viterbi(logits, logits_seq_lens, logits_time_major, targets, targets_seq_lens):
+def ctc_loss_viterbi(logits, logits_seq_lens, logits_time_major, targets, targets_seq_lens, blank_index=-1):
   """
   Similar to :func:`ctc_loss`.
   However, instead of using the full sum, we use the best path (i.e. Viterbi instead of Baum-Welch).
@@ -1438,6 +1454,7 @@ def ctc_loss_viterbi(logits, logits_seq_lens, logits_time_major, targets, target
   :param bool logits_time_major:
   :param tf.Tensor targets: batch-major, [batch,time]
   :param tf.Tensor targets_seq_lens: (batch,)
+  :param int blank_index:
   :return: loss, shape (batch,)
   :rtype: tf.Tensor
   """
@@ -1447,8 +1464,11 @@ def ctc_loss_viterbi(logits, logits_seq_lens, logits_time_major, targets, target
     logits = tf.transpose(logits, [1, 0, 2])  # (time,batch,dim)
   log_sm = tf.nn.log_softmax(logits)  # (time,batch,dim)
 
+  if blank_index < 0:
+    blank_index += dim
+  assert 0 <= blank_index < dim
   edges, weights, start_end_states = get_ctc_fsa_fast_bw(
-    targets=targets, seq_lens=targets_seq_lens, blank_idx=dim - 1)
+    targets=targets, seq_lens=targets_seq_lens, blank_idx=blank_index)
   alignment, scores = fast_viterbi(
     am_scores=log_sm, am_seq_len=logits_seq_lens,
     edges=edges, weights=weights, start_end_states=start_end_states)

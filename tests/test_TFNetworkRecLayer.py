@@ -1219,6 +1219,97 @@ def test_rec_RecStepInfoLayer_broadcast_moved_out():
     assert isinstance(out_v, numpy.ndarray)
 
 
+def test_rec_RecLastOutputLayer():
+  from returnn.tf.util.data import (
+    Dim, batch_dim, single_step_dim, SpatialDim, FeatureDim, ImplicitDynSizeDim, ImplicitSparseDim)
+
+  time_dim = SpatialDim('time')
+  input_dim = FeatureDim('input', 3)
+
+  config = Config(dict(
+    extern_data={
+      'data': {
+        'dim_tags': (
+          batch_dim,
+          time_dim,
+          input_dim
+        ),
+        'dtype': 'float32',
+        'available_for_inference': True
+      }
+    }))
+
+  net_dict = {
+    'output': {
+      'class': 'copy',
+      'from': 'add',
+      'out_shape': {batch_dim, input_dim}
+    },
+    'loop': {
+      'class': 'rec',
+      'from': [],
+      'unit': {
+        'rec_unstack': {
+          'class': 'rec_unstack',
+          'from': 'base:range_in_axis',
+          'axis': time_dim,
+          'out_shape': {}
+        },
+        'add': {
+          'class': 'combine',
+          'from': ['prev:add', 'rec_unstack'],
+          'kind': 'add',
+          'initial_output': 'base:zeros',
+          'need_last': True,
+          'out_shape': {batch_dim, input_dim}
+        },
+        'output': {
+          'class': 'copy',
+          'from': 'rec_unstack',
+          'out_shape': {}
+        }
+      },
+      'axis': time_dim,
+      'out_shape': {ImplicitDynSizeDim(batch_dim), time_dim},
+      'name_scope': ''
+    },
+    'range_in_axis': {
+      'class': 'range_in_axis',
+      'from': 'data:data',
+      'axis': time_dim,
+      'out_shape': {ImplicitDynSizeDim(batch_dim), time_dim}
+    },
+    'zeros': {
+      'class': 'constant',
+      'value': 0,
+      'shape': [
+        batch_dim,
+        input_dim
+      ],
+      'dtype': 'int32'
+    },
+    'add': {
+      'class': 'rec_last_output',
+      'rec_layer': 'loop',
+      'sub_layer_name': 'add',
+      'out_shape': {batch_dim, input_dim}
+    }
+  }
+
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    in_ = net.extern_data.get_default_input_data()
+    out = net.get_default_output_layer().output.copy_as_batch_major()
+    from test_TFNetworkLayer import make_feed_dict
+    out_v, seq_lens = session.run(
+      (out.placeholder, in_.get_sequence_lengths()), feed_dict=make_feed_dict(net.extern_data))
+    print(out_v, seq_lens)
+    sum_over_i = seq_lens * (seq_lens - 1) // 2
+    print(sum_over_i)
+    assert (sum_over_i[:, None] == out_v).all()
+
+
 def test_rec_explicit_lstm():
   net_dict = {
     "lstm": {"class": "rec", "from": "data", "unit": {
@@ -5453,6 +5544,566 @@ def test_reclayer_explicit_rec_ff():
     network.initialize_params(session)
     from test_TFNetworkLayer import make_feed_dict
     session.run(network.get_default_output_layer().output.placeholder, feed_dict=make_feed_dict(network.extern_data))
+
+
+def test_reclayer_att_weights_output_layer():
+  # https://github.com/rwth-i6/returnn/issues/1027
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+
+  time_dim = SpatialDim('time')
+  input_dim = FeatureDim('input', 13)
+  align_classes_dim = FeatureDim("align", 5)
+
+  config = Config({"extern_data": {
+    'data': {
+      'dim_tags': (
+        batch_dim,
+        time_dim,
+        input_dim
+      ),
+      'dtype': 'float32',
+      'available_for_inference': True
+    },
+    'alignment': {
+      'dim_tags': (
+        batch_dim,
+        time_dim,
+      ),
+      "sparse_dim": align_classes_dim,
+      'dtype': 'int32',
+      'available_for_inference': True
+    },
+  }})
+
+  net_dict = {
+    "encoder": {"class": "copy", "from": "data"},
+    "existing_alignment": {"class": "copy", "from": "data:alignment"},
+    "is_label": {
+      "class": "compare",
+      "from": "existing_alignment",
+      "kind": "not_equal",
+      "value": align_classes_dim.dimension - 1,
+    },
+    "label_ground_truth_masked": {
+      "class": "reinterpret_data",
+      "enforce_batch_major": True,
+      "from": "label_ground_truth_masked0",
+      "register_as_extern_data": "label_ground_truth",
+      "set_sparse_dim": align_classes_dim - 1,
+    },
+    "label_ground_truth_masked0": {
+      "class": "masked_computation",
+      "from": "existing_alignment",
+      "mask": "is_label",
+      "unit": {"class": "copy", "from": "data"},
+    },
+    "label_model": {
+      "back_prop": True,
+      "class": "rec",
+      "from": "data:label_ground_truth",
+      "include_eos": True,
+      "is_output_layer": True,
+      "name_scope": "output/rec",
+      "unit": {
+        "att": {"axes": ["stag:heads", input_dim], "class": "merge_dims", "from": "att0"},
+        "att0": {
+          "add_var2_if_empty": False,
+          "class": "dot",
+          "from": ["att_val_split", "att_weights"],
+          "reduce": "stag:att_t",
+          "var1": "f",
+          "var2": None,
+        },
+        "att_ctx": {
+          "L2": None,
+          "activation": None,
+          "class": "linear",
+          "dropout": 0.0,
+          "from": "segments",
+          "n_out": 10,
+          "name_scope": "/enc_ctx",
+          "with_bias": True,
+        },
+        "att_energy": {
+          "class": "reinterpret_data",
+          "from": "att_energy0",
+          "is_output_layer": False,
+          "set_dim_tags": {
+            "f": Dim(
+              kind=Dim.Types.Spatial, description="att_heads", dimension=1
+            )
+          },
+        },
+        "att_energy0": {
+          "activation": None,
+          "class": "linear",
+          "from": ["energy_tanh"],
+          "n_out": 1,
+          "name_scope": "energy",
+          "with_bias": False,
+        },
+        "att_energy_in": {
+          "class": "combine",
+          "from": ["att_ctx", "att_query"],
+          "kind": "add",
+          "n_out": 10,
+        },
+        "att_query": {
+          "activation": None,
+          "class": "linear",
+          "from": "lm",
+          "is_output_layer": False,
+          "n_out": 10,
+          "with_bias": False,
+        },
+        "att_val": {"class": "copy", "from": "segments"},
+        "att_val_split": {
+          "class": "reinterpret_data",
+          "from": "att_val_split0",
+          "set_dim_tags": {
+            "dim:1": Dim(
+              kind=Dim.Types.Spatial, description="att_heads", dimension=1
+            )
+          },
+        },
+        "att_val_split0": {
+          "axis": "f",
+          "class": "split_dims",
+          "dims": (1, -1),
+          "from": "att_val",
+        },
+        "att_weights": {
+          "class": "dropout",
+          "dropout": 0.0,
+          "dropout_noise_shape": {"*": None},
+          "from": "att_weights0",
+          "is_output_layer": True,
+        },
+        "att_weights0": {
+          "axis": "stag:att_t",
+          "class": "softmax_over_spatial",
+          "energy_factor": 0.03125,
+          "from": "att_energy",
+        },
+        "energy_tanh": {
+          "activation": "tanh",
+          "class": "activation",
+          "from": ["att_energy_in"],
+        },
+        "input_embed": {
+          "class": "copy",
+          "from": "prev:target_embed",
+        },
+        "lm": {
+          "class": "rec",
+          "from": ["input_embed", "prev:att"],
+          "n_out": 10,
+          "name_scope": "lm/rec",
+          "unit": "nativelstm2",
+        },
+        "output": {
+          "beam_size": 4,
+          "cheating": "exclusive",
+          "class": "choice",
+          "from": "data",
+          "initial_output": 0,
+          "target": "label_ground_truth",
+        },
+        "segment_lens": {
+          "axis": "t",
+          "class": "gather",
+          "from": "base:data:segment_lens_masked",
+          "position": ":i",
+        },
+        "segment_starts": {
+          "axis": "t",
+          "class": "gather",
+          "from": "base:data:segment_starts_masked",
+          "position": ":i",
+        },
+        "segments": {
+          "class": "reinterpret_data",
+          "from": "segments0",
+          "set_dim_tags": {
+            "stag:sliced-time:segments": Dim(
+              kind=Dim.Types.Spatial, description="att_t"
+            )
+          },
+        },
+        "segments0": {
+          "class": "slice_nd",
+          "from": "base:encoder",
+          "size": "segment_lens",
+          "start": "segment_starts",
+        },
+        "target_embed": {
+          "activation": None,
+          "class": "linear",
+          "from": "output",
+          "initial_output": 0,
+          "n_out": 6,
+          "with_bias": False,
+        },
+      },
+    },
+    "output": {
+      "back_prop": False,
+      "class": "rec",
+      "from": "encoder",
+      "include_eos": True,
+      "initial_output": 0,
+      "size_target": None,
+      "target": "alignment",
+      "unit": {
+        "const1": {"class": "constant", "value": 1},
+        "output": {
+          "beam_size": 4,
+          "cheating": None,
+          "class": "choice",
+          "from": "data",
+          "initial_output": 0,
+          "input_type": "log_prob",
+          "length_normalization": False,
+          "target": "alignment",
+        },
+        "output_emit": {
+          "class": "compare",
+          "from": "output",
+          "initial_output": True,
+          "kind": "not_equal",
+          "value": align_classes_dim.dimension - 1,
+        },
+        "segment_lens": {
+          "class": "combine",
+          "from": ["segment_lens0", "const1"],
+          "is_output_layer": True,
+          "kind": "add",
+        },
+        "segment_lens0": {
+          "class": "combine",
+          "from": [":i", "segment_starts"],
+          "kind": "sub",
+        },
+        "segment_starts": {
+          "class": "switch",
+          "condition": "prev:output_emit",
+          "false_from": "prev:segment_starts",
+          "initial_output": 0,
+          "is_output_layer": True,
+          "true_from": ":i",
+        },
+      },
+    },
+    "segment_lens_masked": {
+      "class": "masked_computation",
+      "from": "output/segment_lens",
+      "mask": "is_label",
+      "out_spatial_dim": Dim(kind=Dim.Types.Spatial, description="label-axis"),
+      "register_as_extern_data": "segment_lens_masked",
+      "unit": {"class": "copy", "from": "data"},
+    },
+    "segment_starts_masked": {
+      "class": "masked_computation",
+      "from": "output/segment_starts",
+      "mask": "is_label",
+      "out_spatial_dim": Dim(kind=Dim.Types.Spatial, description="label-axis"),
+      "register_as_extern_data": "segment_starts_masked",
+      "unit": {"class": "copy", "from": "data"},
+    },
+  }
+
+  with make_scope() as session:
+    network = TFNetwork(config=config, train_flag=True)
+    network.construct_from_dict(net_dict)
+    network.initialize_params(session)
+    from test_TFNetworkLayer import make_feed_dict
+    fetches = network.get_fetches_dict()
+    fetches["out"] = network.get_layer("label_model/att_weights").output.placeholder
+    session.run(fetches, feed_dict=make_feed_dict(network.extern_data))
+
+
+def test_reclayer_subnetwork_base_subnet():
+  with make_scope() as session:
+    net_dict = {
+      'sub': {'class': 'subnetwork', 'from': [], 'subnetwork': {
+        'linear': {'class': 'eval', 'from': 'base:data:data', 'eval': 'source(0) * 0.9'},
+        "reduce": {"class": "reduce", "mode": "mean", "axis": "T", "from": "linear"},
+        'output': {'class': 'copy', 'from': 'linear'}
+      }},
+      'sub2': {'class': 'subnetwork', 'from': [], 'subnetwork': {
+        'rec': {
+          'class': 'rec',
+          'from': "base:data:data",
+          'unit': {
+            'add': {
+              'class': 'combine', 'kind': 'add',
+              'from': ['data:source', 'prev:add', 'base:base:sub/reduce'],
+            },
+            "output": {"class": "copy", "from": "add"},
+          }
+        },
+        "output": {"class": "copy", "from": "rec"},
+      }},
+      'output': {'class': 'copy', 'from': 'sub2'}}
+    config = Config(dict(num_inputs=1, num_outputs=1))
+    network = TFNetwork(config=config)
+    network.construct_from_dict(net_dict)
+    from test_TFNetworkLayer import make_feed_dict
+    session.run(network.get_default_output_layer().output.placeholder, feed_dict=make_feed_dict(network.extern_data))
+
+
+def test_reclayer_scalar_size():
+  with make_scope() as session:
+    net_dict = {
+      'len': {"class": "length", "from": "data"},
+      'max_len': {"class": "reduce", "from": "len", "mode": "max", "axis": "B", "out_shape": ()},
+      'range': {"class": "range_from_length", "from": "max_len"},
+      'rec': {
+        'class': 'rec',
+        'from': "range",
+        'unit': {
+          'add': {
+            'class': 'combine', 'kind': 'add',
+            'from': ['data:source', 'prev:add'],
+          },
+          "output": {"class": "copy", "from": "add"},
+        }
+      },
+      "output": {"class": "copy", "from": "rec"},
+    }
+    config = Config({"extern_data": {"data": {"shape": (None, 3)}}})
+    network = TFNetwork(config=config)
+    network.construct_from_dict(net_dict)
+    from test_TFNetworkLayer import make_feed_dict
+    session.run(network.get_default_output_layer().output.placeholder, feed_dict=make_feed_dict(network.extern_data))
+
+
+def test_reclayer_scalar_size_last():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+
+  time_dim = SpatialDim('time')
+  feat_dim = FeatureDim('feat', 5)
+  config = Config(dict(
+    extern_data={'data': {'dim_tags': (batch_dim, time_dim, feat_dim)}},
+    debug_runtime_sanity_checks=True,
+  ))
+
+  top_k_dim = SpatialDim('top-k-dim')
+
+  net_dict = {
+    'test_specaugment_v2_name_scope_simplify': {
+      'class': 'subnetwork',
+      'from': [],
+      'subnetwork': {
+        'random': {
+          'class': 'subnetwork',
+          'from': [],
+          'subnetwork': {
+            'random': {
+              'class': 'random',
+              'shape': [
+                batch_dim
+              ],
+              'distribution': 'uniform',
+              'minval': 1,
+              'maxval': 3,
+              'dtype': 'int32',
+            },
+            'output': {
+              'class': 'copy',
+              'from': 'random',
+              'out_shape': {batch_dim}
+            },
+          },
+          'out_shape': {batch_dim}
+        },
+        'random_0': {
+          'class': 'subnetwork',
+          'from': [],
+          'subnetwork': {
+            'random': {
+              'class': 'random',
+              'shape': [
+                batch_dim,
+                feat_dim
+              ],
+              'distribution': 'uniform',
+              'minval': 0.0,
+              'maxval': 1.0,
+            },
+            'output': {
+              'class': 'copy',
+              'from': 'random',
+              'out_shape': {batch_dim, feat_dim}
+            },
+          },
+          'out_shape': {batch_dim, feat_dim}
+        },
+        'reduce': {
+          'class': 'reduce',
+          'from': 'random',
+          'mode': 'max',
+          'axis': (batch_dim,),
+          'out_shape': {}
+        },
+        'top_k': {
+          'class': 'top_k',
+          'from': 'random_0',
+          'axis': feat_dim,
+          'k': 'reduce',
+          'k_dim': top_k_dim,
+          'sorted': True,
+          'out_shape': {batch_dim, top_k_dim}
+        },
+        'loop': {
+          'class': 'rec',
+          'from': [],
+          'unit': {
+            'state.x': {
+              'class': 'copy',
+              'from': 'test_specaugment_v2_name_scope_simplify._relu_0',
+              'initial_output': 'base:base:data:data',
+              'out_shape': {batch_dim, time_dim, feat_dim}
+            },
+            'Loop.unstack': {
+              'class': 'rec_unstack',
+              'from': 'base:range_in_axis',
+              'axis': top_k_dim,
+              'out_shape': {}
+            },
+            'output': {
+              'class': 'copy',
+              'from': 'Loop.unstack',
+              'out_shape': {}
+            },
+            'test_specaugment_v2_name_scope_simplify._relu_0': {
+              'class': 'activation',
+              'from': 'prev:state.x',
+              'activation': 'relu',
+              'need_last': True,
+              'out_shape': {batch_dim, time_dim, feat_dim}
+            }
+          },
+          'axis': top_k_dim,
+          'out_shape': {top_k_dim},
+          'name_scope': ''
+        },
+        'range_in_axis': {
+          'class': 'range_in_axis',
+          'from': 'top_k/indices',
+          'axis': top_k_dim,
+          'out_shape': {top_k_dim}
+        },
+        'test_specaugment_v2_name_scope_simplify._relu_0': {
+          'class': 'rec_last_output',
+          'rec_layer': 'loop',
+          'sub_layer_name': 'test_specaugment_v2_name_scope_simplify._relu_0',
+          'out_shape': {batch_dim, time_dim, feat_dim}
+        },
+        'output': {
+          'class': 'copy',
+          'from': 'test_specaugment_v2_name_scope_simplify._relu_0',
+          'out_shape': {batch_dim, time_dim, feat_dim}
+        }
+      },
+      'out_shape': {batch_dim, time_dim, feat_dim}
+    },
+    'output': {
+      'class': 'copy',
+      'from': 'test_specaugment_v2_name_scope_simplify',
+      'out_shape': {batch_dim, time_dim, feat_dim}
+    }
+  }
+
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    out = net.get_default_output_layer().output
+    net.initialize_params(session)
+    from test_TFNetworkLayer import make_feed_dict
+    session.run((out.placeholder, out.get_sequence_lengths()), feed_dict=make_feed_dict(net.extern_data))
+
+
+def test_reclayer_shape_from_initial():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+
+  time_dim = SpatialDim('time')
+  input_dim = FeatureDim('input', 13)
+  loop_dim = SpatialDim('loop-dim')
+
+  config = Config({"extern_data": {'data': {'dim_tags': (batch_dim, time_dim, input_dim)}}})
+
+  net_dict = {
+    'output': {
+      'class': 'copy',
+      'from': 'loop/output',
+      'out_shape': {batch_dim, input_dim, loop_dim}
+    },
+    'constant': {'class': 'constant', 'value': 10},
+    'loop': {
+      'class': 'rec',
+      'from': [],
+      'unit': {
+        'add': {
+          'class': 'eval',
+          'from': 'prev:add',
+          'eval': 'source(0) + 1.0',
+          'initial_output': 'base:zeros',
+          'out_shape': {batch_dim}
+        },
+        'greater_equal': {
+          'class': 'compare',
+          'from': 'add',
+          'kind': 'greater_equal',
+          'value': 5.0,
+          'out_shape': {batch_dim}
+        },
+        'end': {
+          'class': 'copy',
+          'from': 'greater_equal',
+          'out_shape': {batch_dim}
+        },
+        'reduce': {
+          'class': 'reduce',
+          'from': 'base:data:data',
+          'mode': 'mean',
+          'axis': time_dim,
+          'out_shape': {batch_dim, input_dim}
+        },
+        'mul': {
+          'class': 'combine',
+          'from': ['add', 'reduce'],
+          'kind': 'mul',
+          'out_shape': {batch_dim, input_dim}
+        },
+        'output': {
+          'class': 'copy',
+          'from': 'mul',
+          'out_shape': {batch_dim, input_dim}
+        }
+      },
+      'max_seq_len_via': 'constant',
+      'axis': loop_dim,
+      'include_eos': True,
+      'out_shape': {batch_dim, input_dim, loop_dim},
+      'name_scope': ''
+    },
+    'zeros': {
+      'class': 'constant',
+      'value': 0,
+      'shape': [
+        batch_dim
+      ],
+      'dtype': 'float32'
+    }
+  }
+
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    out = net.get_default_output_layer().output
+    from test_TFNetworkLayer import make_feed_dict
+    session.run(out.placeholder, feed_dict=make_feed_dict(net.extern_data))
 
 
 def test_convert_lstm_params_save_load():

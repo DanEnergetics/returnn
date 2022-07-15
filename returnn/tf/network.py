@@ -172,11 +172,19 @@ class ExternData(object):
         # Maybe via register_as_extern_data and non-standard batch (e.g. beam).
         continue
       for tag in data.dim_tags + tuple(tag.get_same_base() for tag in data.dim_tags):
-        if tag.is_batch_dim():
-          tag.batch = batch_info
+        # Do not set batch dim batch info.
+        # Data.batch assignment below should cover that, and we do not want to overwrite some global dim tag.
+        # Usually it was set before via _create_size_placeholder.
+        # Also check whether the current size or batch is still valid in current graph, and maybe reset.
+        # noinspection PyProtectedMember
+        tag._validate_in_current_graph()
         if tag.dyn_size_ext and tag.dyn_size_ext.have_batch_axis():
+          assert not tag.batch or tag.batch == batch_info
+          assert not tag.dyn_size_ext.batch or tag.dyn_size_ext.batch == batch_info
           tag.dyn_size_ext.batch = batch_info
           tag.batch = batch_info
+      # Set this last because this will trigger _adapt_batch_consistent_dim_tags
+      # which might reset the dyn_size_ext when it does not match the batch info.
       data.batch = batch_info
       # The data might have been completed by the batch info, thus recheck.
       data.sanity_check()
@@ -370,7 +378,7 @@ class TFNetwork(object):
                parent_layer=None, parent_net=None, extra_parent_net=None, extra_name_prefix=None,
                inside_rec_time_dim=None, over_rec_time_dim=None, over_rec_time_dim_subs=None,
                control_flow_ctx=None,
-               absolute_name_prefix=None, name=None):
+               absolute_name_prefix=None, name=""):
     """
     :param returnn.config.Config config: only needed to init extern_data if not specified explicitly
     :param ExternData|None extern_data:
@@ -388,11 +396,8 @@ class TFNetwork(object):
     :param set[Dim]|None over_rec_time_dim_subs: outer rec layer, out of loop, potential shorter
     :param returnn.tf.util.data.ControlFlowContext control_flow_ctx:
     :param str|None absolute_name_prefix: this is for representation
-    :param str|None name: only for debugging
+    :param str name: only for debugging
     """
-    if name is None:
-      from returnn.util.basic import try_get_caller_name
-      name = "<network via %s>" % try_get_caller_name(fallback="<unknown>")
     self.name = name
     if absolute_name_prefix:
       assert absolute_name_prefix.endswith("/")
@@ -1340,6 +1345,8 @@ class TFNetwork(object):
 
     def _make_layer(layer_cls, layer_dict, map_opts=True):
       """
+      Creates the flattened layer
+
       :param type[LayerBase]|LayerBase layer_cls:
       :param dict[str] layer_dict:
       :param bool map_opts:
@@ -1350,6 +1357,8 @@ class TFNetwork(object):
         opts = nest.map_structure(_map_layer_dict_value, opts)
       opts.pop("output", None)
       opts["output"] = layer_cls.get_out_data_from_opts(**opts)
+      opts.pop("out_shape", None)
+      opts["output"] = layer_cls.fixup_out_data(**opts)
       print(
         "Loss flattened layer %s/%r output: %r" % (opts["network"].name, opts["name"], opts["output"]), file=log.v3)
       layer__ = layer_cls(**opts)
@@ -1367,6 +1376,8 @@ class TFNetwork(object):
 
     def _should_flatten_layer_output(layer_):
       """
+      Decides whether layer output has right properties for flattening
+
       :param LayerBase layer_:
       :rtype: bool
       """
@@ -1383,6 +1394,8 @@ class TFNetwork(object):
 
     def _check_push_flattening_to_inputs_for_layer_simple(layer_):
       """
+      Checks preconditions for input flattening
+
       :param LayerBase layer_:
       :rtype: bool
       """
@@ -1400,6 +1413,8 @@ class TFNetwork(object):
 
     def _check_push_flattening_to_inputs_for_layer(layer_):
       """
+      Checks whether the inputs to the layer should be flattened aswell
+
       :param LayerBase layer_:
       :rtype: bool
       """
@@ -1432,14 +1447,17 @@ class TFNetwork(object):
 
     def _resolve_layer(layer_):
       """
+      Flattens the layer structure, removes irrelevant layers and returns next successor layer
+
       :param LayerBase layer_:
+      :return: next layer in succession
       :rtype: LayerBase
       """
       while True:
         if isinstance(layer_, SubnetworkLayer):
           layer_ = layer_.subnetwork.layers["output"]
           continue
-        if isinstance(layer_, CopyLayer) and len(layer_.sources) == 1:
+        if type(layer_) is CopyLayer and len(layer_.sources) == 1:
           layer_ = layer_.sources[0]
           continue
         return layer_
@@ -1592,7 +1610,7 @@ class TFNetwork(object):
     if config is None:
       config = self.get_config()
     if should_train is None:
-      should_train = self.train_flag
+      should_train = self.train_flag is not False
     if should_eval is None:
       should_eval = self.eval_flag
     use_horovod_reduction = False
@@ -1755,6 +1773,12 @@ class TFNetwork(object):
     :param str layer_name:
     :rtype: LayerBase
     """
+    if layer_name.startswith("base:"):
+      if not self.parent_net:
+        raise LayerNotFound(
+          "layer %r not found, there is no parent net of %r" % (layer_name, self),
+          layer_name=layer_name, network=self)
+      return self.parent_net.get_layer(layer_name[len("base:"):])
     if layer_name in self.layers:
       return self.layers[layer_name]
     orig_layer_name = layer_name
@@ -1768,7 +1792,7 @@ class TFNetwork(object):
       sub_layer = root_layer.get_sub_layer(sub_layer_name)  # get the sub-layer from the root-layer
       if not sub_layer:
         raise LayerNotFound(
-          "sub-layer %r not found in layer %r in net %r" % (root_layer, sub_layer, self),
+          "sub-layer %r not found in layer %r in net %r" % (sub_layer_name, root_layer, self),
           layer_name=orig_layer_name, network=self)
       return sub_layer
     if self._extra_layer_name_prefix_pattern.match(layer_name):

@@ -667,7 +667,10 @@ class RecLayer(_ConcatInputLayer):
       if not in_data.sparse:
         in_data = in_data.copy_with_feature_last()
     else:
-      in_data = in_data.copy_as_time_batch_major()
+      if in_data.have_batch_axis():
+        in_data = in_data.copy_as_time_batch_major()
+      else:
+        in_data = in_data.copy_as_time_major()
     in_data_ = in_data
     if strict and in_data_.batch_ndim_dense != 3:
       assert in_data_.batch_ndim_dense > 3
@@ -1592,7 +1595,7 @@ class _SubnetworkRecCell(object):
         if self.parent_net.eval_flag and layer.get("loss"):  # only collect losses if we need them
           get_templated_layer.construct(layer_name)
       for layer_name, layer in sorted(self.net_dict.items()):
-        if layer.get("is_output_layer"):
+        if layer.get("is_output_layer") or layer.get("need_last"):
           get_templated_layer.construct(layer_name)
 
       # Because of the logic to lazily init deps, or some of the kwargs sources partially None,
@@ -1610,7 +1613,7 @@ class _SubnetworkRecCell(object):
           old_output = layer.output
           direct_get_layer.construct(layer.name)
           if layer.output.get_compare_key() != old_output.get_compare_key():
-            recent_changes.append((old_output, layer.output))
+            recent_changes.append(("layer %r:" % layer.name, old_output, "vs", layer.output))
         if len(ConstructCtx.partially_finished) < old_len:
           # Ok, this is some real progress.
           continue
@@ -1683,13 +1686,12 @@ class _SubnetworkRecCell(object):
     layer_dict = layer_dict.copy()
     layer_class_name = layer_dict.pop("class")
     layer_class = get_layer_class(layer_class_name)
-    layer_dict["_network"] = self.net
-    layer_dict["_name"] = layer_name
+    layer_dict.update(dict(name=layer_name, _name=layer_name, network=self.net, _network=self.net))
     layer_class.transform_config_dict(
       layer_dict, network=self.net, get_layer=lambda _name: self.layer_data_templates[_name])
-    out = layer_class.get_out_data_from_opts(name=layer_name, network=self.net, **layer_dict)
-    out = layer_class.fixup_out_data(output=out, network=self.net, **layer_dict)
-    layer.init(output=out, layer_class=layer_class, **layer_dict)
+    layer_dict["output"] = layer_class.get_out_data_from_opts(**layer_dict)
+    layer_dict["output"] = layer_class.fixup_out_data(**layer_dict)
+    layer.init(layer_class=layer_class, **layer_dict)
     self.layer_data_templates[layer_name] = layer
     return layer
 
@@ -2093,12 +2095,24 @@ class _SubnetworkRecCell(object):
       if not layer.need_last:
         continue
       with tf.name_scope(layer.tf_scope_name):
-        indices = layer.output.get_sequence_lengths() - 1  # [B]
         out = layer.output.copy_as_batch_major().copy_with_time_dim_axis(1)  # [B,T,...]
-        v = tf.gather(out.placeholder, indices=tf.maximum(indices, 0), batch_dims=1, axis=1)  # [B,...]
-        v = tf.where(tf.less(indices, 0), self._get_init_output(k), v)
+        time_dim = out.dim_tags[1]
+        if time_dim.dyn_size_ext:
+          indices = time_dim.dyn_size_ext.copy()
+        else:
+          indices = Data.from_tensor(tf_util.get_shape_dim(out.placeholder, 0))
+        indices.placeholder = indices.placeholder - 1
+        v = tf.gather(
+          out.placeholder,
+          indices=tf.maximum(
+            indices.copy_compatible_to(
+              Data("dummy", dim_tags=out.dim_tags[:1], dtype="int32"), unbroadcast=True).placeholder, 0),
+          batch_dims=1, axis=1)  # [B,...]
         layer_template = self.layer_data_templates[k]
         out = layer_template.output.copy_template()
+        v = tf.where(
+          tf.less(indices.copy_compatible_to(out, check_sparse=False, check_dtype=False).placeholder, 0),
+          self._get_init_output(k), v)
         out.placeholder = v
         assert k not in self._last_frames
         self._last_frames[k] = out
@@ -2343,6 +2357,7 @@ class _SubnetworkRecCell(object):
           target_data = rec_layer._get_target_value(
             target=rec_layer.target, mark_data_key_as_used=False)
           input_beam = target_data.beam
+      fixed_seq_len = None
       if rec_layer.output.size_placeholder and not output_template_search_choices:
         # See LayerBase._post_init_output(). could be set via target or size_target...
         # This should only be the case in training.
@@ -2351,8 +2366,11 @@ class _SubnetworkRecCell(object):
         # noinspection PyProtectedMember
         fixed_seq_len = rec_layer._get_target_value(
           target=rec_layer.size_target, mark_data_key_as_used=True).get_sequence_lengths()
-      else:
-        fixed_seq_len = None
+      elif rec_layer.time_dim_tag and not output_template_search_choices:
+        batch = rec_layer.get_batch_info()
+        tag = rec_layer.time_dim_tag.get_for_batch_ctx(batch, rec_layer.output.control_flow_ctx)
+        if tag.dyn_size_ext and tag.dyn_size_ext.placeholder is not None:
+          fixed_seq_len = tag.dyn_size
       if fixed_seq_len is None and "end" not in self.layer_data_templates:
         # If 'end' layer is not existing, the length must be defined.
         # In some cases (training with given target) we know the target sequence length.
@@ -2363,11 +2381,13 @@ class _SubnetworkRecCell(object):
       if fixed_seq_len is not None:
         time_dim_tag = Dim.get_tag_from_size_tensor(fixed_seq_len)
         assert time_dim_tag == self.time_dim_tag
-        with tf.name_scope("check_seq_len_batch_size"):
-          fixed_seq_len = check_input_dim(
-            fixed_seq_len, axis=0, dim=batch_dim * (input_beam.beam_size if input_beam else 1))
-          if time_dim_tag:
-            time_dim_tag.set_tag_on_size_tensor(fixed_seq_len, batch=time_dim_tag.batch, same_as_before=True)
+        if fixed_seq_len.get_shape().ndims > 0:
+          assert fixed_seq_len.get_shape().ndims == 1
+          with tf.name_scope("check_seq_len_batch_size"):
+            fixed_seq_len = check_input_dim(
+              fixed_seq_len, axis=0, dim=batch_dim * (input_beam.beam_size if input_beam else 1))
+            if time_dim_tag:
+              time_dim_tag.set_tag_on_size_tensor(fixed_seq_len, batch=time_dim_tag.batch, same_as_before=True)
         max_seq_len = tf.reduce_max(fixed_seq_len, name="max_seq_len")
         have_known_seq_len = True
       else:
@@ -2469,6 +2489,8 @@ class _SubnetworkRecCell(object):
         if template.is_output_layer():
           needed_outputs.add(name)
           extra_output_layers.add(name)
+        if template.need_last:
+          needed_outputs.add(name)
 
       layer_names_with_losses = []
       if rec_layer.network.eval_flag:  # only collect losses if we need them
@@ -2799,15 +2821,27 @@ class _SubnetworkRecCell(object):
           # We need to make sure that the output is correct also for the seqs which are already ended.
           prev_layer = self.net.layers["prev:" + k]
           # Last frame corresponds to the frame seq_len - 1.
-          # With include_eos=False, when "end" layer is True <=> we are behind the last frame.
-          # With include_eos=True, when "prev:end" layer is True <=> we are behind the last frame.
-          rel_end_layer = self.net.layers["prev:end"] if rec_layer.include_eos else self.net.layers["end"]
+          if seq_len_info:
+            # With include_eos=False, when "end" layer is True <=> we are behind the last frame.
+            # With include_eos=True, when "prev:end" layer is True <=> we are behind the last frame.
+            rel_end_layer = self.net.layers["prev:end"] if rec_layer.include_eos else self.net.layers["end"]
+          else:
+            assert fixed_seq_len is not None and time_dim_tag and time_dim_tag.dyn_size_ext
+            end_flag_data = time_dim_tag.dyn_size_ext.copy_template()
+            end_flag_data.dtype = "bool"
+            end_flag_data.placeholder = tf.greater_equal(
+              # Without include_eos, end_flag=True happens first in frame seq_lens.
+              # With include_eos, end_flag=True happens first in frame seq_lens - 1.
+              i, (fixed_seq_len - 1) if rec_layer.include_eos else fixed_seq_len)
+            from returnn.tf.layers.basic import InternalLayer
+            rel_end_layer = InternalLayer(name="rel_end_layer", network=self.net, output=end_flag_data)
           choices = layer.get_search_choices()
           if choices:
             prev_layer, rel_end_layer = choices.translate_to_this_search_beam([prev_layer, rel_end_layer])
           from returnn.tf.util.basic import where_bc
           layer.output.placeholder = where_bc(
-            condition=rel_end_layer.output.copy_compatible_to(layer.output).placeholder,
+            condition=rel_end_layer.output.copy_compatible_to(
+              layer.output, check_sparse=False, check_dtype=False).placeholder,
             x=prev_layer.output.placeholder, y=layer.output.placeholder)
 
         if seq_len_info is not None:
@@ -4351,8 +4385,12 @@ class RecLastOutputLayer(LayerBase):
     :param str sub_layer_name:
     :rtype: Data
     """
-    assert isinstance(rec_layer, RecLayer)
-    cell = rec_layer.cell
+    if isinstance(rec_layer, _TemplateLayer):
+      assert issubclass(rec_layer.layer_class_type, RecLayer)
+      cell = rec_layer.kwargs["unit"]
+    else:
+      assert isinstance(rec_layer, RecLayer)
+      cell = rec_layer.cell
     assert isinstance(cell, _SubnetworkRecCell)
     return cell.layer_data_templates[sub_layer_name].output
 
@@ -7320,6 +7358,114 @@ class KenLmStateLayer(_ConcatInputLayer):
       "scores": tf.zeros(batch_shape, dtype=tf.float32)}
 
 
+class EditDistanceLayer(LayerBase):
+  """
+  Edit distance, also known as Levenshtein distance,
+  or in case of words, word error rate (WER),
+  or in case of characters, character error rate (CER).
+
+  This will not normalize the result, i.e. return the absolut minimal number of edits
+  (add, delete, replace) to transform the first string into the second string.
+  For WER/CER, it is common to normalize by the length of the target string,
+  but accumulated per epoch.
+  """
+  layer_class = "edit_distance"
+  recurrent = True
+
+  def __init__(self, a, b, a_spatial_dim=None, b_spatial_dim=None, **kwargs):
+    """
+    :param LayerBase a:
+    :param LayerBase b:
+    :param str|Dim|None a_spatial_dim:
+    :param str|Dim|None b_spatial_dim:
+    """
+    super(EditDistanceLayer, self).__init__(**kwargs)
+    self.a = a
+    self.b = b
+    if a_spatial_dim is None:
+      assert a.output.have_time_axis()
+      a_axis = a.output.time_dim_axis
+    else:
+      a_axis = a.output.get_axis_from_description(a_spatial_dim)
+    if b_spatial_dim is None:
+      assert b.output.have_time_axis()
+      b_axis = b.output.time_dim_axis
+    else:
+      b_axis = b.output.get_axis_from_description(b_spatial_dim)
+    a_template = self.output.copy_template().copy_add_dim_by_tag(
+      a.output.dim_tags[a_axis], unbroadcast=True, axis=-1)
+    b_template = self.output.copy_template().copy_add_dim_by_tag(
+      b.output.dim_tags[b_axis], unbroadcast=True, axis=-1)
+    a_ext = a.output.copy_compatible_to(a_template, check_sparse=False)
+    b_ext = b.output.copy_compatible_to(b_template, check_sparse=False)
+    a_tensor = a_ext.placeholder
+    b_tensor = b_ext.placeholder
+    from returnn.tf.native_op import edit_distance
+    common_shape = None
+    if a_ext.batch_ndim != 2:
+      common_shape = tf_util.get_shape(a_ext.placeholder)
+      common_shape, a_rem_dim = common_shape[:-1], common_shape[-1]
+      b_rem_dim = tf_util.get_shape_dim(b_ext.placeholder, -1)
+      common_reduce = tf_util.optional_mul(*common_shape)
+      if common_reduce is None:
+        common_reduce = 1
+      a_tensor = tf.reshape(a_tensor, [common_reduce, a_rem_dim])
+      b_tensor = tf.reshape(b_tensor, [common_reduce, b_rem_dim])
+    y_tensor = edit_distance(
+      a=a_tensor,
+      a_len=a_ext.dim_tags[-1].dyn_size,
+      b=b_tensor,
+      b_len=b_ext.dim_tags[-1].dyn_size)
+    if a_ext.batch_ndim != 2:
+      y_tensor = tf.reshape(y_tensor, common_shape)
+    self.output.placeholder = y_tensor
+
+  def get_dep_layers(self):
+    """
+    :rtype: list[LayerBase]
+    """
+    return [self.a, self.b]
+
+  @classmethod
+  def transform_config_dict(cls, d, network, get_layer):
+    """
+    :param dict[str] d: will modify inplace
+    :param returnn.tf.network.TFNetwork network:
+    :param returnn.tf.network.GetLayer|((str)->LayerBase) get_layer: function to get or construct another layer
+    """
+    d.setdefault("from", [])
+    super(EditDistanceLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)
+    d["a"] = get_layer(d["a"])
+    d["b"] = get_layer(d["b"])
+
+  @classmethod
+  def get_out_data_from_opts(cls, name, a, b, a_spatial_dim=None, b_spatial_dim=None, **kwargs):
+    """
+    :param str name:
+    :param LayerBase a:
+    :param LayerBase b:
+    :param str|Dim|None a_spatial_dim:
+    :param str|Dim|None b_spatial_dim:
+    :rtype: Data
+    """
+    if a_spatial_dim is None:
+      assert a.output.have_time_axis()
+      a_axis = a.output.time_dim_axis
+    else:
+      a_axis = a.output.get_axis_from_description(a_spatial_dim)
+    if b_spatial_dim is None:
+      assert b.output.have_time_axis()
+      b_axis = b.output.time_dim_axis
+    else:
+      b_axis = b.output.get_axis_from_description(b_spatial_dim)
+    a_rem = a.output.copy_template_excluding_axis(a_axis)
+    b_rem = b.output.copy_template_excluding_axis(b_axis)
+    out = Data.get_common_data([a_rem, b_rem], allow_broadcast_all_sources=False)
+    out = out.copy_template("%s_output" % name)
+    out.sparse_dim = None
+    return out
+
+
 class EditDistanceTableLayer(LayerBase):
   """
   Given a source and a target, calculates the edit distance table between them.
@@ -9623,7 +9769,7 @@ class CumConcatLayer(_ConcatInputLayer):
       self.rec_vars_outputs["state"] = concat_frames
       self.output.placeholder = concat_frames
 
-      if not new_dim_.dyn_size_ext:
+      if not new_dim_.dyn_size_ext or new_dim_.dyn_size_ext.placeholder is None:
         # Unbroadcasting to [B] is not needed because any layers operating on this
         # should be able to handle extended dyn sizes.
         # Clipping it to the max length for sequences in the loop which are already ended
@@ -9672,6 +9818,13 @@ class CumConcatLayer(_ConcatInputLayer):
 
     if not input_data.has_axis(rec_time_dim):  # inside loop
       assert ctx and ctx.is_loop() and ctx.loop_spatial_dim == rec_time_dim
+
+      new_dim_in_ctx.dyn_size_ext = Data(
+        name="%s:cum-concat:size-inside" % name,
+        dim_tags=[],  # scalar
+        dtype="int32",
+        batch=input_data.batch, control_flow_ctx=ctx)
+
       # Currently SelectSearchSourcesLayer assumes that all rec_vars_outputs are batch-major.
       # Therefore we here copy the input as batch-major, and then add the time axis at axis 1.
       # In the future, when SelectSearchSourcesLayer has support for this, we can change this to operate on axis 0,

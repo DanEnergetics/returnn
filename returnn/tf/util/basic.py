@@ -408,7 +408,7 @@ def get_valid_scope_name_from_str(s):
   # NOTE: Be careful changing this logic. Try to never change the behavior for existing cases,
   # because this name is used e.g. for layers, and you might introduce incompatibility by changes here.
   import re
-  s = re.sub("[:(){}&+*'\"]", "__", s)
+  s = re.sub("[:(){}&+\\-*'\" ,]", "__", s)
   if s[:1] in "_-\\/":  # invalid first chars
     s = (".%i." % ord(s[0])) + s[1:]
   return s
@@ -433,6 +433,11 @@ def get_current_name_scope():
   Note that this is a private member and might break at some point.
   Note also that this does not need to be the same as get_current_var_scope_name().
   """
+  if tf_compat.executing_eagerly():
+    # tf.get_current_name_scope() is not available in earlier TF versions, even with eager mode.
+    from tensorflow.python.eager import context
+    ctx = context.context()
+    return ctx.scope_name.rstrip("/")
   # noinspection PyProtectedMember
   return tf_compat.v1.get_default_graph()._name_stack or ""
 
@@ -550,6 +555,9 @@ def reuse_name_scope_of_tensor(x, prefix="", postfix="", add_tensor_name=False):
   :param bool add_tensor_name:
   :return: reuse the name scope of x, e.g. "layer0/rec", yields scope
   """
+  if tf_compat.executing_eagerly():
+    yield tf_compat.v1.get_variable_scope()
+    return
   name_scope = get_name_scope_of_tensor(x)
   if add_tensor_name:
     from returnn.util.basic import unicode_to_str
@@ -1840,7 +1848,8 @@ class TensorCachedComputation:
     :param str|tuple[str|int|tf.Tensor] key:
     """
     self.x = x
-    self.key = key
+    from returnn.util import basic as util
+    self.key = util.make_hashable(key)
 
   def _get_cache_dict(self):
     """
@@ -2387,7 +2396,7 @@ def get_common_shape(values, ignore_axes=(), allow_broadcast_all_sources=NotSpec
             assert common_shape[axis] == static_dim, "non matching dim %r vs %r in axis %i, value %r of values %r" % (
               common_shape[axis], static_dim, axis, value, values)
     # Check validate_broadcast_all_sources
-    need_broadcast = {value: False for value in values}
+    need_broadcast = {id(value): False for value in values}
     for axis in range(ndim):
       if axis in ignore_axes:
         continue  # does not matter
@@ -2395,7 +2404,7 @@ def get_common_shape(values, ignore_axes=(), allow_broadcast_all_sources=NotSpec
         static_value_dim = value.shape.dims[axis].value  # type: typing.Optional[int]
         static_common_dim = common_shape[axis] if isinstance(common_shape[axis], int) else None
         if static_value_dim == 1 and static_common_dim != 1:
-          need_broadcast[value] = True
+          need_broadcast[id(value)] = True
     if all(need_broadcast.values()):
       validate_broadcast_all_sources(
         allow_broadcast_all_sources=allow_broadcast_all_sources, inputs=values, common="shape %s" % (common_shape,))
@@ -5393,6 +5402,8 @@ def _get_control_flows(v, yield_none):
   """
   import numpy
   from tensorflow.python.ops.control_flow_ops import ControlFlowContext
+  if tf_compat.executing_eagerly():
+    return
   if isinstance(v, (list, tuple)):
     for elem in v:
       for t in _get_control_flows(elem, yield_none=yield_none):
@@ -5425,6 +5436,8 @@ def _get_control_flow_graphs(v):
   :rtype: typing.Iterator[tensorflow.python.ops.control_flow_v2_func_graphs.ControlFlowFuncGraph]
   """
   if not ControlFlowFuncGraph:
+    return
+  if tf_compat.executing_eagerly():
     return
   import numpy
   if isinstance(v, (list, tuple)):
@@ -5469,6 +5482,9 @@ def same_control_flow_ctx(x):
   :param tf.Tensor|tf.Operation|int|float|None|list[tf.Tensor|tf.Operation|int|float] x:
   :return: yields context (via tf.control_dependencies)
   """
+  if tf_compat.executing_eagerly():
+    yield None
+    return
   cur_graph = tf_compat.v1.get_default_graph()
   inside_control_flow_graph = False
   if ControlFlowFuncGraph:
@@ -6382,6 +6398,31 @@ def get_variable_grad_from_update_ops(var, update_ops):
   return grad
 
 
+def get_variable_from_tensor(var):
+  """
+  :param tf.Variable|tf.Tensor var:
+  :return: resolve tf.identity or read ops
+  :rtype: tf.Variable|tf.Tensor
+  """
+  while True:
+    if isinstance(var, tf.Variable):
+      return var
+    assert isinstance(var, tf.Tensor)
+    if var.op.type == "Identity":
+      var = var.op.inputs[0]
+      continue
+    if var.op.type == "ReadVariableOp":
+      var = var.op.inputs[0]
+      continue
+    if var.op.type in {"VarHandleOp", "VariableV2"}:
+      for v in var.graph.get_collection("variables"):
+        assert isinstance(v, tf.Variable)
+        if v.op is var.op:
+          return v
+      raise Exception("Could not find variable for var_handle_op %r." % var.op)
+    return var
+
+
 def add_control_input(op, control_input):
   """
   :param tf.Operation op:
@@ -6532,9 +6573,11 @@ def get_sparse_tensor_length(x):
 
 def string_words_calc_wer(hyps, refs):
   """
-  :param tf.Tensor hyps: (batch,)
-  :param tf.Tensor refs: (batch,)
-  :return: (WER (batch,), num ref words (batch,))
+  Uses :func:`words_split` on hyps and refs, and then tf.edit_distance with normalize=False.
+
+  :param tf.Tensor hyps: (batch,), dtype string
+  :param tf.Tensor refs: (batch,), dtype string
+  :return: (WER (batch,) unnormalized, num ref words (batch,))
   :rtype: (tf.Tensor, tf.Tensor)
   """
   refs.set_shape(hyps.get_shape())
@@ -6965,6 +7008,32 @@ def safe_deep_copy(obj):
     # Our own types, which should not be copied.
     Dim]
   return deepcopy(obj, stop_types=stop_types)
+
+
+class TensorRef:
+  """
+  Reference to the original tensor, which is hashable.
+  We have this here for compatibility because tf.Tensor.ref() was not available in earlier TF versions.
+  """
+  def __init__(self, tensor):
+    """
+    :param tf.Tensor tensor:
+    """
+    self.tensor = tensor
+
+  def __repr__(self):
+    return "TensorRef{%r}" % self.tensor
+
+  def __eq__(self, other):
+    if other is None or not isinstance(other, TensorRef):
+      return False
+    return self.tensor is other.tensor
+
+  def __ne__(self, other):
+    return not self.__eq__(other)
+
+  def __hash__(self):
+    return id(self.tensor)
 
 
 class FetchHelper:

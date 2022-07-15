@@ -121,7 +121,7 @@ class Dim(object):
     if dyn_size_ext:
       assert batch == dyn_size_ext.batch
     self.dyn_size_ext = dyn_size_ext  # type: typing.Optional[Data]
-    self._dyn_size_same = set()  # type: typing.Set[tf.Tensor]
+    self._dyn_size_same = set()  # set of TensorRef
     self._undefined = undefined
     self.generic = generic
     self.special = special
@@ -256,12 +256,14 @@ class Dim(object):
     if not isinstance(tensor, tf.Tensor):
       if self.dyn_size_ext and self.dyn_size_ext.placeholder is not None:
         tensor = self.dyn_size_ext.placeholder
-    if isinstance(tensor, tf.Tensor):
+    if isinstance(tensor, tf.Tensor) and not tf_compat.executing_eagerly():
       from returnn.tf.util import basic as tf_util
       g = tf_util.get_root_graph()
       if tf_util.get_root_graph(tensor.graph) is not g:  # maybe from an earlier run which reuses the dim tag
         # Reset and cleanup.
-        self.dyn_size_ext = None
+        if self.dyn_size_ext:
+          self.dyn_size_ext = self.dyn_size_ext.copy_template()
+          self.dyn_size_ext.batch = None
         same_base = self.get_same_base()
         same_base._same_for_batch_ctx.pop((self.batch, self.control_flow_ctx), None)
         self.batch = None  # it is invalid in the new graph
@@ -355,28 +357,30 @@ class Dim(object):
             base_can_use_in_ctx = tag
             break
       if base_can_use_in_ctx and base_can_use_in_ctx.dyn_size_ext:
-        # The same_base has some dyn size without any beam nor control flow context.
-        # We can expand it to the current beam, or extend by padded batch.
-        dyn_size_ext = base_can_use_in_ctx.dyn_size_ext.copy_extend_batch(batch)
-        if batch.beam:
-          dyn_size_ext = base_can_use_in_ctx.dyn_size_ext.copy_extend_with_beam(batch.beam)
-        assert dyn_size_ext.batch == batch
-        beam_expanded_base_data = getattr(dyn_size_ext.placeholder, "_RETURNN_beam_expanded_base_data", None)
-        if batch.beam:
-          assert beam_expanded_base_data
-        # Note: The beam expansion used tiling, which can be cached.
-        # This means that we could end up with the same size tensor (placeholder) for multiple different beams,
-        # when there are different beams with same beam size!
-        # This breaks the current logic in get_tag_from_size_tensor.
-        # As a workaround, we make an explicit new tensor here.
-        from .basic import get_valid_scope_name_from_str, same_control_flow_ctx
-        with same_control_flow_ctx(dyn_size_ext.placeholder):
-          dyn_size_ext.placeholder = tf.identity(
-            dyn_size_ext.placeholder,
-            name=get_valid_scope_name_from_str("%s_get_for_batch_ctx_%s" % (dyn_size_ext.name, batch.short_repr())))
-        if batch.beam:
-          dyn_size_ext.placeholder._RETURNN_dyn_size_beam = batch.beam
-          dyn_size_ext.placeholder._RETURNN_beam_expanded_base_data = beam_expanded_base_data
+        if base_can_use_in_ctx.dyn_size_ext.have_batch_axis():
+          # The same_base has some dyn size without any beam nor control flow context.
+          # We can expand it to the current beam, or extend by padded batch.
+          dyn_size_ext = base_can_use_in_ctx.dyn_size_ext.copy_extend_batch(batch)
+          if batch.beam:
+            dyn_size_ext = base_can_use_in_ctx.dyn_size_ext.copy_extend_with_beam(batch.beam)
+          assert dyn_size_ext.batch == batch
+          if dyn_size_ext.placeholder is not None:
+            beam_expanded_base_data = getattr(dyn_size_ext.placeholder, "_RETURNN_beam_expanded_base_data", None)
+            if batch.beam:
+              assert beam_expanded_base_data
+            # Note: The beam expansion used tiling, which can be cached.
+            # This means that we could end up with the same size tensor (placeholder) for multiple different beams,
+            # when there are different beams with same beam size!
+            # This breaks the current logic in get_tag_from_size_tensor.
+            # As a workaround, we make an explicit new tensor here.
+            from .basic import get_valid_scope_name_from_str, same_control_flow_ctx
+            with same_control_flow_ctx(dyn_size_ext.placeholder):
+              dyn_size_ext.placeholder = tf.identity(
+                dyn_size_ext.placeholder,
+                name=get_valid_scope_name_from_str("%s_get_for_batch_ctx_%s" % (dyn_size_ext.name, batch.short_repr())))
+            if batch.beam:
+              dyn_size_ext.placeholder._RETURNN_dyn_size_beam = batch.beam
+              dyn_size_ext.placeholder._RETURNN_beam_expanded_base_data = beam_expanded_base_data
     if not dyn_size_ext and allow_none:
       return None
     dim_tag = Dim(
@@ -386,8 +390,9 @@ class Dim(object):
       dyn_size_ext=dyn_size_ext)
     dim_tag.same_as = same_base
     dim_tag._same_as_tb = traceback.extract_stack()
-    if dyn_size_ext:
-      dim_tag.set_tag_on_size_tensor(dyn_size_ext.placeholder, batch=batch)
+    if dyn_size_ext and dyn_size_ext.placeholder is not None:
+      if Dim.get_tag_from_size_tensor(dyn_size_ext.placeholder) is None:
+        dim_tag.set_tag_on_size_tensor(dyn_size_ext.placeholder, batch=batch)
     same_base._same_for_batch_ctx[(dim_tag.batch, dim_tag.control_flow_ctx)] = dim_tag
     return dim_tag
 
@@ -438,6 +443,8 @@ class Dim(object):
   @dyn_size.setter
   def dyn_size(self, dyn_size):
     """
+    Also see :func:`set_dyn_size_ext_for_batch_ctx`.
+
     :param tf.Tensor dyn_size:
     """
     assert self.can_be_used_as_dim()
@@ -521,7 +528,8 @@ class Dim(object):
     """
     if x is self.dyn_size:
       return True
-    if x in self._dyn_size_same:
+    from .basic import TensorRef
+    if TensorRef(x) in self._dyn_size_same:
       return True
     return False
 
@@ -538,6 +546,7 @@ class Dim(object):
     which just differ by an expansion of the batch (e.g. search beam).
 
     See also :func:`get_tag_from_size_tensor`.
+    Also see :func:`set_dyn_size_ext_for_batch_ctx`.
 
     :param tf.Tensor x:
     :param BatchInfo|None batch:
@@ -546,6 +555,7 @@ class Dim(object):
     :return: self or new dim tag
     :rtype: Dim
     """
+    from .basic import TensorRef
     assert self.can_be_used_as_dim()
     # It's unusual if self.dimension is not None, but let's accept that.
     if hasattr(x, "_is_size_of_dim_tag"):
@@ -558,10 +568,10 @@ class Dim(object):
       new_dim_tag.set_tag_on_size_tensor(x, batch=batch)
       return new_dim_tag
     if self.dyn_size is not None and self.dyn_size is not x:
-      if x in self._dyn_size_same:
+      if TensorRef(x) in self._dyn_size_same:
         pass  # ok, pass on
       elif same_as_before:
-        self._dyn_size_same.add(x)
+        self._dyn_size_same.add(TensorRef(x))
         # And now pass on.
       else:
         assert self.batch and batch
@@ -620,7 +630,7 @@ class Dim(object):
       def _is_negative(x__):
         if isinstance(x__, numpy.ndarray):
           return (x__ < 0).any()
-        if isinstance(x__, (int, float)):
+        if isinstance(x__, (int, float, numpy.number)):
           return x__ < 0
         assert isinstance(x__, tf.Tensor)
         x__ = tensor_util.constant_value(x__)
@@ -629,6 +639,8 @@ class Dim(object):
         return False
 
       def _bin_op(a, b):
+        if a is None or b is None:
+          return None
         with tf_util.same_control_flow_ctx([a, b]):
           if kind == "add":
             use_relu = _is_negative(a) or _is_negative(b)  # for dynamic tensors, assume all positive
@@ -664,7 +676,7 @@ class Dim(object):
         if self.batch:
           x = x.get_for_batch_ctx(self.batch, self.control_flow_ctx)
         x.complete_dyn_size()
-        if not x.dyn_size_ext or x.dyn_size_ext.placeholder is None:
+        if not x.dyn_size_ext:
           return
         x = x.dyn_size_ext
         if y is None:
@@ -679,8 +691,11 @@ class Dim(object):
           x_, y_ = x, y
         y.placeholder = _bin_op(y_.placeholder, x_.placeholder)
       assert y
+      if self.dyn_size_ext:
+        assert self.dyn_size_ext.dim_tags == y.dim_tags
       self.dyn_size_ext = y
-      self.set_tag_on_size_tensor(y.placeholder)
+      if y.placeholder is not None:
+        self.set_tag_on_size_tensor(y.placeholder)
 
   def is_equal(self, other, ignore_feature_dim=False, allow_same_feature_dim=False, allow_same_spatial_dim=None,
                treat_feature_as_spatial=False, broadcast_matches=False, unknown_spatial_matches=False,
@@ -843,7 +858,7 @@ class Dim(object):
 
   def get_derived_bases_list(self):
     """
-    :rtype: Dim
+    :rtype: list[Dim]
     """
     res = [self]
     base = self
@@ -885,7 +900,7 @@ class Dim(object):
     assert self.can_be_used_as_dim() and other.can_be_used_as_dim()  # declare_same_as does not make sense otherwise
     self._maybe_update()
     self._validate_in_current_graph()
-    if self is other:
+    if self == other:
       return
     other_same_base = other.get_same_base()
     if self is other_same_base or self.same_as is other_same_base:
@@ -897,6 +912,12 @@ class Dim(object):
       # We actually want it to be the other way around.
       other_same_base.declare_same_as(self_same_as)
       return
+    other_derived_bases = set(other.get_derived_bases_list())
+    self_derived_bases = set(self.get_derived_bases_list())
+    assert other_derived_bases != self_derived_bases
+    if self_derived_bases.issubset(other_derived_bases):
+      # Avoid cycles on derived_from_tag. https://github.com/rwth-i6/returnn/issues/1054
+      return other.declare_same_as(self)
     if self_same_as is not self:
       assert not self_same_as.same_as
       if self_same_as is other_same_base:
@@ -2666,7 +2687,9 @@ class Data(object):
     if beam and batch:
       assert batch.beam == beam
     self._batch = batch
+    del batch
     self._beam = beam
+    del beam
     self.control_flow_ctx = control_flow_ctx
     self.available_for_inference = available_for_inference
     if isinstance(dim_tags, (tuple, list)):
@@ -2685,6 +2708,9 @@ class Data(object):
       dim_tags = tuple(dim_tags)
       if auto_create_placeholders:
         _auto_create_size_placeholders_on_dim_tags(name=name, dim_tags=dim_tags)
+      if batch_dim_axis_ is not None:
+        if dim_tags[batch_dim_axis_].batch and not self._batch:
+          self._batch = dim_tags[batch_dim_axis_].batch
       del shape_
       del batch_dim_axis_
     else:
@@ -2780,12 +2806,12 @@ class Data(object):
     """
     import numpy
     if dtype is None:
-      if isinstance(x, int):
+      if isinstance(x, bool):
+        dtype = "bool"
+      elif isinstance(x, int):
         dtype = "int32"
       elif isinstance(x, float):
         dtype = "float32"
-      elif isinstance(x, bool):
-        dtype = "bool"
       elif isinstance(x, numpy.ndarray):
         dtype = str(x.dtype)
       else:
@@ -3111,10 +3137,9 @@ class Data(object):
     :rtype: object
     """
     return (
-      self.name, self.dtype,
+      self.dtype,
       self.shape,
       self.batch_dim_axis, self.feature_dim_axis, self.time_dim_axis,
-      sorted(self.size_placeholder.keys()),
       self.dim_tags,
       self.batch, self.beam)
 
@@ -3363,7 +3388,7 @@ class Data(object):
     dim_tags = list(self.dim_tags)
     if dim_tag:
       assert dim_tag.is_batch_dim()
-      assert dim_tag.dimension == batch.static_dim
+      assert dim_tag.dimension == batch.static_dim or dim_tag.dimension is None
       assert dim_tag.batch == batch
     else:
       dim_tag = Dim(
@@ -3461,8 +3486,7 @@ class Data(object):
 
     if dim_tag.is_batch_dim():
       if unbroadcast:
-        batch_info = dim_tag.src_data.batch if dim_tag.src_data else None
-        return self.copy_add_batch_dim(batch_dim_axis=axis, batch=batch_info, dim_tag=dim_tag)
+        return self.copy_add_batch_dim(batch_dim_axis=axis, batch=dim_tag.batch, dim_tag=dim_tag)
       else:
         batch_info = BatchInfo.make_global_broadcast_batch_info()
         return self.copy_add_batch_dim(
@@ -3866,7 +3890,6 @@ class Data(object):
     :return: copy of myself excluding the time-dimension without placeholder
     :rtype: Data
     """
-    assert self.batch_dim_axis is not None
     assert self.time_dim_axis is not None
     return self.copy_template_excluding_axis(exclude_axis=self.time_dim_axis, name=name)
 
@@ -3988,10 +4011,11 @@ class Data(object):
           if isinstance(virtual_dim, BatchInfo.PackedDim):
             dim_tags.append(virtual_dim.dim_tag)
             batch = batch.copy_remove_dim(virtual_dim)
-          elif not new_batch_dim_tag:
-            new_batch_dim_tag = batch_dim
+          elif isinstance(virtual_dim, BatchInfo.GlobalBatchDim):
+            assert not new_batch_dim_tag
+            new_batch_dim_tag = Dim(kind=Dim.Types.Batch, description=dim_tag.description)
             dim_tags.append(new_batch_dim_tag)
-        assert new_batch_dim_tag
+        assert new_batch_dim_tag, "%s: batch info %r invalid" % (self, batch)
         new_batch_dim_tag.batch = batch
         kwargs["batch"] = batch
       else:
@@ -5064,6 +5088,7 @@ class Data(object):
     assert axis != self.batch_dim_axis
     tag = self.dim_tags[axis]
     assert tag.dyn_size_ext
+    assert set(tag.dyn_size_ext.dim_tags).issubset(self.dim_tags)  # https://github.com/rwth-i6/returnn/issues/721
     with tf.name_scope("get_sequence_mask_broadcast"):
       if tag.dyn_size_ext.have_batch_axis() and tag.dyn_size_ext.batch_ndim == 1:  # just [B]
         # This is the common case where the size is of shape [B].
@@ -5085,7 +5110,6 @@ class Data(object):
         # We use the assumption that self.placeholder.shape[axis] == max_idx.
         idx_range = tf.range(max_idx)
         idx_range = tf.reshape(idx_range, [1] * axis + [max_idx] + [1] * (self.batch_ndim - axis - 1))
-        assert set(tag.dyn_size_ext.dim_tags).issubset(self.dim_tags)  # https://github.com/rwth-i6/returnn/issues/721
         # size_ext might have invalid (zero) sizes when it itself has some padding, e.g. when its own shape is dynamic.
         # A zero size can lead to problems in some cases, e.g. in SoftmaxOverSpatialLayer,
         # when everything is masked to -inf, it results in nan, and this likely produces nan in backprop or elsewhere.
@@ -5096,6 +5120,26 @@ class Data(object):
         seq_mask = tf.less(idx_range, size_ext.placeholder)
         assert seq_mask.get_shape().ndims == self.batch_ndim
     return seq_mask
+
+  def get_sequence_lengths_broadcast(self, axis=None):
+    """
+    :param int|None axis:
+    :return: seq len of some shape which is broadcastable to self.placeholder.
+      Note that this is not always possible, e.g. when the seq len has shape [B]
+      but the tensor has just shape [T]. We currently throw an error then.
+    :rtype: tf.Tensor
+    """
+    if axis is None:
+      assert self.time_dim_axis is not None
+      axis = self.time_dim_axis
+    if axis < 0:
+      assert axis + self.batch_ndim > 0
+      axis += self.batch_ndim
+    assert 0 <= axis < self.batch_ndim
+    assert axis != self.batch_dim_axis
+    tag = self.dim_tags[axis]
+    assert tag.dyn_size_ext
+    return tag.dyn_size_ext.copy_compatible_to(self, check_dtype=False, check_sparse=False).placeholder
 
   def copy_masked(self, mask_value):
     """
@@ -5558,16 +5602,39 @@ def _batch_shape_from_shape(shape, batch_dim_axis):
     return shape
 
 
-def _create_size_placeholder(name, axis_wo_b, tag):
+# noinspection PyShadowingNames
+def _create_size_placeholder(name, axis_wo_b, tag, batch_dim):
   """
   :param str name:
   :param int axis_wo_b:
   :param Dim tag:
+  :param Dim|None batch_dim:
   """
+  # Note on batch info: Usually, this is called early when no global batch info is initialized yet.
+  # Then it is later initialized via ExternData.init_batch_info.
+  # Some other external code (e.g. returnn-common) might have set custom batch info
+  # on some Data instance, and via Data._adapt_batch_consistent_dim_tags / Dim.get_for_batch_ctx,
+  # that might have been set on uninitialized dim tags as well.
+  # Now when we get such dim tags here, they would have some Dim.batch info set
+  # but this does not correspond to the global batch info which we will get here.
+  # Only trust batch_dim here, or if that batch info is unset, then leave it uninitialized,
+  # or even explicitly set it to None, see below.
   from .basic import reuse_name_scope
   with reuse_name_scope("extern_data/placeholders/%s" % name, absolute=True):
+    dyn_size_ext = Data(
+      "%s_dim%i_size" % (name, axis_wo_b), dtype=Data.size_dtype,
+      dim_tags=[batch_dim] if batch_dim else [],
+      batch=batch_dim.batch if batch_dim else None)
     dyn_size = tf_compat.v1.placeholder(
-      name="%s_dim%i_size" % (name, axis_wo_b), dtype=Data.size_dtype, shape=(None,))
+      name=dyn_size_ext.name, dtype=dyn_size_ext.dtype, shape=dyn_size_ext.batch_shape)
+    dyn_size_ext.placeholder = dyn_size
+    if dyn_size_ext.batch:
+      tag.set_dyn_size_ext_for_batch_ctx(
+        batch=dyn_size_ext.batch, ctx=dyn_size_ext.control_flow_ctx, dyn_size_ext=dyn_size_ext)
+      # Do not set tag.batch. set_dyn_size_ext_for_batch_ctx should cover this.
+    else:
+      tag.batch = None  # reset, it is anyway invalid, see above
+      tag.dyn_size_ext = dyn_size_ext
     tag.set_tag_on_size_tensor(dyn_size)
 
 
@@ -5606,6 +5673,8 @@ def _infer_dim_tags_tuple_from_shape(
   dim_tags = dim_tags.copy() if dim_tags else {}
   if batch_dim_axis is not None and batch_dim_axis not in dim_tags:
     dim_tags[batch_dim_axis] = Dim(kind=Dim.Types.Batch, description="batch:%s" % name)
+  # noinspection PyShadowingNames
+  batch_dim = dim_tags[batch_dim_axis] if batch_dim_axis is not None else None
   # Note: Consistent to Data.get_dim_tag,
   # prefer interpretation as spatial axis if there is a dynamic size or this is marked as time axis.
   if size_placeholder:
@@ -5641,7 +5710,7 @@ def _infer_dim_tags_tuple_from_shape(
           # This is such that Dim.is_equal behaves as before, e.g. in Data.get_common_data.
           kind=Dim.Types.Spatial)
         dim_tags[axis] = tag
-      _create_size_placeholder(name=name, axis_wo_b=axis_wo_b, tag=tag)
+      _create_size_placeholder(name=name, axis_wo_b=axis_wo_b, tag=tag, batch_dim=batch_dim)
       dyn_size = tag.dyn_size
     if tag:
       # Just some sanity checks.
@@ -5679,17 +5748,23 @@ def _auto_create_size_placeholders_on_dim_tags(name, dim_tags):
   :param tuple[Dim] dim_tags:
   """
   batch_dim_axis = _batch_dim_axis_from_dim_tags_tuple(dim_tags)
+  batch_dim_ = dim_tags[batch_dim_axis] if batch_dim_axis is not None else None
+  if batch_dim_:
+    # Do this first, in case the batch dim is used elsewhere,
+    # to avoid that we use some invalid batch info.
+    # noinspection PyProtectedMember
+    batch_dim_._validate_in_current_graph()
   for axis, tag in enumerate(dim_tags):
+    # noinspection PyProtectedMember
+    tag._validate_in_current_graph()
     if tag.is_batch_dim():
       continue
     if tag.dimension is not None:
       continue
-    # noinspection PyProtectedMember
-    tag._validate_in_current_graph()
     if tag.dyn_size is not None:
       continue
     axis_wo_b = _get_axis_wo_b(axis, batch_dim_axis=batch_dim_axis)
-    _create_size_placeholder(name=name, axis_wo_b=axis_wo_b, tag=tag)
+    _create_size_placeholder(name=name, axis_wo_b=axis_wo_b, tag=tag, batch_dim=batch_dim_)
 
 
 def _get_axis_wo_b(axis_wb, batch_dim_axis, batch_ndim=None):

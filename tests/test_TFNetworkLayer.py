@@ -2753,6 +2753,1514 @@ def test_SwitchLayer_template_const_from():
   assert switch.dim == 2
 
 
+def test_TopKLayer_single_axis():
+  config = Config({
+    "extern_data": {"data": {"shape": (None, 5)}},
+  })
+  with make_scope() as session:
+    net = TFNetwork(config=config, train_flag=True)
+    net.construct_from_dict({
+      "output": {
+        "class": "top_k", "from": "data", "axis": "F", "k": 2},  # (B,T)
+    })
+    in_data = net.extern_data.data["data"]
+    in_np = numpy.arange(2 * 3 * 5).reshape((2, 3, 5)).astype(in_data.dtype)
+    in_sizes = [3, 2]
+    values = net.get_layer("output").output
+    indices = net.get_layer("output/indices").output
+    values_np, indices_np = session.run(
+      (values.placeholder, indices.placeholder),
+      feed_dict={in_data.placeholder: in_np, in_data.get_sequence_lengths(): in_sizes})
+    print("inputs:\n", in_np)
+    print("values:\n", values_np)
+    print("indices:\n", indices_np)
+    assert (indices_np == numpy.array([4, 3])[None, None]).all()
+
+
+def test_TopKLayer_two_axes():
+  config = Config({
+    "extern_data": {"data": {"shape": (3, 5)}},
+  })
+  with make_scope() as session:
+    net = TFNetwork(config=config, train_flag=True)
+    net.construct_from_dict({
+      "output": {
+        "class": "top_k", "from": "data", "axis": ("dim:3", "dim:5"), "k": 2},  # (B,T)
+    })
+    in_data = net.extern_data.data["data"]
+    in_np = numpy.arange(2 * 3 * 5).reshape((2, 3, 5)).astype(in_data.dtype)
+    values = net.get_layer("output").output
+    indices0 = net.get_layer("output/indices0").output
+    indices1 = net.get_layer("output/indices1").output
+    values_np, indices0_np, indices1_np = session.run(
+      (values.placeholder, indices0.placeholder, indices1.placeholder),
+      feed_dict={in_data.placeholder: in_np})
+    print("inputs:\n", in_np)
+    print("values:\n", values_np)
+    print("indices0:\n", indices0_np)
+    print("indices1:\n", indices1_np)
+    assert (indices0_np == 2).all()
+    assert (indices1_np == numpy.array([4, 3])[None]).all()
+
+
+def test_TopKLayer_in_cond_kdim():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+
+  time_dim = SpatialDim('time')
+  feat_dim = FeatureDim('feat', 5)
+
+  config = Config(dict(
+    extern_data={
+      'data': {
+        'dim_tags': (batch_dim, time_dim, feat_dim),
+        'dtype': 'float32',
+        'available_for_inference': True
+      }
+    },
+    debug_runtime_sanity_checks=True,
+    debug_print_layer_output_shape=True,
+    debug_print_layer_output=True,
+  ))
+
+  k_dim = SpatialDim('feature_masking:num')
+
+  net_dict = {
+    'specaugment_v2': {
+      'class': 'subnetwork',
+      'from': [],
+      'subnetwork': {
+        'train_flag': {'class': 'train_flag'},
+        'cond': {
+          'class': 'cond',
+          'from': [],
+          'condition': 'train_flag',
+          'true_layer': {
+            'class': 'subnetwork',
+            'from': [],
+            'subnetwork': {
+              'k': {
+                'class': 'random', "shape": (), "distribution": "uniform", "dtype": "int32",
+                "minval": 2, "maxval": 4,
+              },
+              'scores': {
+                "class": "reduce", "from": "base:base:data", "mode": "max", "axis": time_dim,
+                "out_shape": {batch_dim, feat_dim}
+              },
+              'top_k': {
+                'class': 'top_k',
+                'from': 'scores',
+                'axis': feat_dim,
+                'k': 'k',
+                'k_dim': k_dim,
+                'sorted': True,
+                'out_shape': {batch_dim, k_dim}
+              },
+              'range_in_axis': {
+                'class': 'range_in_axis',
+                'from': 'top_k/indices',
+                'axis': k_dim,
+                'out_shape': {k_dim}
+              },
+              'output': {
+                'class': 'reduce', 'from': 'range_in_axis', "mode": "max",
+                "axis": k_dim
+              }
+            }
+          },
+          'false_layer': {
+            'class': 'subnetwork',
+            'from': [],
+            'subnetwork': {
+              'output': {
+                'class': 'constant', "value": -1, "dtype": "int32",
+                'out_shape': {}
+              }
+            }
+          },
+          'name_scope': ''
+        },
+        "output": {"class": "copy", "from": "cond"},
+      },
+    },
+    'output': {
+      'class': 'copy',
+      'from': 'specaugment_v2',
+    }
+  }
+
+  with make_scope() as session:
+    train_flag = tf_util.get_global_train_flag_placeholder()
+    net = TFNetwork(config=config, train_flag=train_flag)
+    net.construct_from_dict(net_dict)
+    net.initialize_params(session)
+    feed_dict = make_feed_dict(net.extern_data)
+    feed_dict[train_flag] = False
+    res_eval = session.run(net.get_default_output_layer().output.placeholder, feed_dict=feed_dict)
+    print("eval:", res_eval)
+    feed_dict[train_flag] = True
+    res_train = session.run(net.get_default_output_layer().output.placeholder, feed_dict=feed_dict)
+    print("train:", res_train)
+
+
+def test_specaugment_pure_returnn_reduced_with_cond():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim, ImplicitSparseDim
+
+  time_dim = SpatialDim('time')
+  feat_dim = FeatureDim('feat', 50)
+
+  config = Config(dict(
+    extern_data={
+      'data': {
+        'dim_tags': (batch_dim, time_dim, feat_dim),
+        'dtype': 'float32',
+        'available_for_inference': True
+      }
+    },
+    debug_runtime_sanity_checks=True,
+    debug_print_layer_output_shape=True,
+  ))
+
+  specaugment_v2_cond_true_feature_masking_top_k_k_dim = SpatialDim('feature_masking:num')
+
+  net_dict = {
+    'specaugment_v2': {
+      'class': 'subnetwork',
+      'from': [],
+      'subnetwork': {
+        'ones': {'class': 'constant', 'value': True, 'shape': (), 'dtype': 'bool'},
+        'cond': {
+          'class': 'cond',
+          'from': [],
+          'condition': 'ones',
+          'true_layer': {
+            'class': 'subnetwork',
+            'from': [],
+            'subnetwork': {
+              'dim_value': {
+                'class': 'subnetwork',
+                'from': [],
+                'subnetwork': {
+                  'length': {
+                    'class': 'length',
+                    'from': 'base:base:base:data:data',
+                    'axis': time_dim,
+                    'out_shape': {batch_dim}
+                  },
+                  'reduce': {
+                    'class': 'reduce',
+                    'from': 'length',
+                    'mode': 'max',
+                    'axis': (batch_dim,),
+                    'out_shape': {}
+                  },
+                  'output': {
+                    'class': 'copy',
+                    'from': 'reduce',
+                    'out_shape': {}
+                  }
+                },
+                'out_shape': {}
+              },
+              'constant': {'class': 'constant', 'value': 2},
+              'minimum': {
+                'class': 'combine',
+                'from': ['constant', 'dim_value'],
+                'kind': 'minimum',
+                'out_shape': {}
+              },
+              'constant_0': {'class': 'constant', 'value': 100},
+              'floordiv': {
+                'class': 'combine',
+                'from': ['dim_value', 'constant_0'],
+                'kind': 'floordiv',
+                'out_shape': {}
+              },
+              'constant_1': {'class': 'constant', 'value': 2},
+              'maximum': {
+                'class': 'combine',
+                'from': ['floordiv', 'constant_1'],
+                'kind': 'maximum',
+                'out_shape': {}
+              },
+              'constant_2': {'class': 'constant', 'value': 4},
+              'mul': {
+                'class': 'combine',
+                'from': ['maximum', 'constant_2'],
+                'kind': 'mul',
+                'out_shape': {}
+              },
+              'minimum_0': {
+                'class': 'combine',
+                'from': ['mul', 'dim_value'],
+                'kind': 'minimum',
+                'out_shape': {}
+              },
+              'feature_masking': {
+                'class': 'subnetwork',
+                'from': [],
+                'subnetwork': {
+                  'random': {
+                    'class': 'subnetwork',
+                    'from': [],
+                    'subnetwork': {
+                      'random': {
+                        'class': 'random',
+                        'shape': [
+                          batch_dim
+                        ],
+                        'distribution': 'uniform',
+                        'minval': 2,
+                        'maxval': 6,
+                        'dtype': 'int32',
+                      },
+                      'output': {
+                        'class': 'copy',
+                        'from': 'random',
+                        'out_shape': {batch_dim}
+                      }
+                    },
+                    'out_shape': {batch_dim}
+                  },
+                  'random_0': {
+                    'class': 'subnetwork',
+                    'from': [],
+                    'subnetwork': {
+                      'random': {
+                        'class': 'random',
+                        'shape': [
+                          batch_dim,
+                          feat_dim
+                        ],
+                        'distribution': 'uniform',
+                        'minval': 0.0,
+                        'maxval': 1.0,
+                      },
+                      'output': {
+                        'class': 'copy',
+                        'from': 'random',
+                        'out_shape': {batch_dim, feat_dim}
+                      }
+                    },
+                    'out_shape': {batch_dim, feat_dim}
+                  },
+                  'log': {
+                    'class': 'activation',
+                    'from': 'random_0',
+                    'activation': 'log',
+                    'out_shape': {batch_dim, feat_dim}
+                  },
+                  'negative': {
+                    'class': 'activation',
+                    'from': 'log',
+                    'activation': 'negative',
+                    'out_shape': {batch_dim, feat_dim}
+                  },
+                  'log_0': {
+                    'class': 'activation',
+                    'from': 'negative',
+                    'activation': 'log',
+                    'out_shape': {batch_dim, feat_dim}
+                  },
+                  'negative_0': {
+                    'class': 'activation',
+                    'from': 'log_0',
+                    'activation': 'negative',
+                    'out_shape': {batch_dim, feat_dim}
+                  },
+                  'reduce': {
+                    'class': 'reduce',
+                    'from': 'random',
+                    'mode': 'max',
+                    'axis': (batch_dim,),
+                    'out_shape': {}
+                  },
+                  'top_k': {
+                    'class': 'top_k',
+                    'from': 'negative_0',
+                    'axis': feat_dim,
+                    'k': 'reduce',
+                    'k_dim': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                    'sorted': True,
+                    'out_shape': {batch_dim, specaugment_v2_cond_true_feature_masking_top_k_k_dim}
+                  },
+                  'loop': {
+                    'class': 'rec',
+                    'from': [],
+                    'unit': {
+                      'rec_unstack': {
+                        'class': 'rec_unstack',
+                        'from': 'base:range_in_axis',
+                        'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                        'out_shape': {}
+                      },
+                      'gather': {
+                        'class': 'gather',
+                        'from': 'base:top_k/indices',
+                        'position': 'rec_unstack',
+                        'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                        'out_shape': {batch_dim, ImplicitSparseDim(feat_dim)}
+                      },
+                      '_mask_v2': {
+                        'class': 'subnetwork',
+                        'from': [],
+                        'subnetwork': {
+                          'length': {
+                            'class': 'length',
+                            'from': 'base:prev:_mask_v2',
+                            'axis': feat_dim,
+                            'out_shape': {}
+                          },
+                          'random': {
+                            'class': 'subnetwork',
+                            'from': [],
+                            'subnetwork': {
+                              'random': {
+                                'class': 'random',
+                                'shape': (batch_dim,),
+                                'distribution': 'uniform',
+                                'minval': 1,
+                                'maxval': 11,
+                                'dtype': 'int32',
+                              },
+                              'output': {
+                                'class': 'copy',
+                                'from': 'random',
+                                'out_shape': {batch_dim}
+                              }
+                            },
+                            'out_shape': {batch_dim}
+                          },
+                          'add': {
+                            'class': 'combine',
+                            'from': ['base:gather', 'random'],
+                            'kind': 'add',
+                            'out_shape': {batch_dim, ImplicitSparseDim(feat_dim)}
+                          },
+                          'minimum': {
+                            'class': 'combine',
+                            'from': ['add', 'length'],
+                            'kind': 'minimum',
+                            'out_shape': {batch_dim, ImplicitSparseDim(feat_dim)}
+                          },
+                          'range_in_axis': {
+                            'class': 'range_in_axis',
+                            'from': 'base:prev:_mask_v2',
+                            'axis': feat_dim,
+                            'out_shape': {feat_dim}
+                          },
+                          'greater_equal': {
+                            'class': 'compare',
+                            'from': ['range_in_axis', 'base:gather'],
+                            'kind': 'greater_equal',
+                            'allow_broadcast_all_sources': True,
+                            'out_shape': {batch_dim, feat_dim}
+                          },
+                          'less': {
+                            'class': 'compare',
+                            'from': ['range_in_axis', 'minimum'],
+                            'kind': 'less',
+                            'allow_broadcast_all_sources': True,
+                            'out_shape': {batch_dim, feat_dim}
+                          },
+                          'logical_and': {
+                            'class': 'combine',
+                            'from': ['greater_equal', 'less'],
+                            'kind': 'logical_and',
+                            'out_shape': {batch_dim, feat_dim}
+                          },
+                          'where': {
+                            'class': 'switch',
+                            'condition': 'logical_and',
+                            'true_from': 0.0,
+                            'false_from': 'base:prev:_mask_v2',
+                            'out_shape': {batch_dim, time_dim, feat_dim}
+                          },
+                          'output': {
+                            'class': 'copy',
+                            'from': 'where',
+                            'out_shape': {batch_dim, time_dim, feat_dim}
+                          }
+                        },
+                        'initial_output': 'base:base:base:base:data',
+                        'need_last': True,
+                        'out_shape': {batch_dim, time_dim, feat_dim}
+                      },
+                      'output': {
+                        'class': 'copy',
+                        'from': 'rec_unstack',
+                        'out_shape': {}
+                      }
+                    },
+                    'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                    'out_shape': {specaugment_v2_cond_true_feature_masking_top_k_k_dim},
+                    'name_scope': ''
+                  },
+                  'range_in_axis': {
+                    'class': 'range_in_axis',
+                    'from': 'top_k/indices',
+                    'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                    'out_shape': {specaugment_v2_cond_true_feature_masking_top_k_k_dim}
+                  },
+                  '_mask_v2': {
+                    'class': 'rec_last_output',
+                    'rec_layer': 'loop',
+                    'sub_layer_name': '_mask_v2',
+                    'out_shape': {batch_dim, time_dim, feat_dim}
+                  },
+                  'output': {
+                    'class': 'copy',
+                    'from': '_mask_v2',
+                    'out_shape': {batch_dim, time_dim, feat_dim}
+                  }
+                },
+                'out_shape': {batch_dim, time_dim, feat_dim}
+              },
+              'output': {
+                'class': 'copy',
+                'from': 'feature_masking',
+                'out_shape': {batch_dim, time_dim, feat_dim}
+              }
+            }
+          },
+          'false_layer': {
+            'class': 'subnetwork',
+            'from': [],
+            'subnetwork': {
+              'output': {
+                'class': 'copy',
+                'from': 'base:base:data:data',
+                'out_shape': {batch_dim, time_dim, feat_dim}
+              }
+            }
+          },
+          'out_shape': {batch_dim, time_dim, feat_dim},
+          'name_scope': ''
+        },
+        "output": {"class": "copy", "from": "cond"},
+      },
+      'out_shape': {batch_dim, time_dim, feat_dim}
+    },
+    'output': {
+      'class': 'copy',
+      'from': 'specaugment_v2',
+      'out_shape': {batch_dim, time_dim, feat_dim}
+    }
+  }
+
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    net.initialize_params(session)
+    session.run(net.get_default_output_layer().output.placeholder, feed_dict=make_feed_dict(net.extern_data))
+
+
+def test_specaugment_pure_returnn_reduced():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim, ImplicitSparseDim
+
+  time_dim = SpatialDim('time')
+  feat_dim = FeatureDim('feat', 50)
+
+  config = Config(dict(
+    extern_data={
+      'data': {
+        'dim_tags': (batch_dim, time_dim, feat_dim),
+        'dtype': 'float32',
+        'available_for_inference': True
+      }
+    },
+    debug_runtime_sanity_checks=True,
+  ))
+
+  specaugment_v2_cond_true_feature_masking_top_k_k_dim = SpatialDim('feature_masking:num')
+
+  net_dict = {
+    'specaugment_v2': {
+      'class': 'subnetwork',
+      'from': [],
+      'subnetwork': {
+        'dim_value': {
+          'class': 'subnetwork',
+          'from': [],
+          'subnetwork': {
+            'length': {
+              'class': 'length',
+              'from': 'base:base:data:data',
+              'axis': time_dim,
+              'out_shape': {batch_dim}
+            },
+            'reduce': {
+              'class': 'reduce',
+              'from': 'length',
+              'mode': 'max',
+              'axis': (batch_dim,),
+              'out_shape': {}
+            },
+            'output': {
+              'class': 'copy',
+              'from': 'reduce',
+              'out_shape': {}
+            }
+          },
+          'out_shape': {}
+        },
+        'constant': {'class': 'constant', 'value': 2},
+        'minimum': {
+          'class': 'combine',
+          'from': ['constant', 'dim_value'],
+          'kind': 'minimum',
+          'out_shape': {}
+        },
+        'constant_0': {'class': 'constant', 'value': 100},
+        'floordiv': {
+          'class': 'combine',
+          'from': ['dim_value', 'constant_0'],
+          'kind': 'floordiv',
+          'out_shape': {}
+        },
+        'constant_1': {'class': 'constant', 'value': 2},
+        'maximum': {
+          'class': 'combine',
+          'from': ['floordiv', 'constant_1'],
+          'kind': 'maximum',
+          'out_shape': {}
+        },
+        'constant_2': {'class': 'constant', 'value': 4},
+        'mul': {
+          'class': 'combine',
+          'from': ['maximum', 'constant_2'],
+          'kind': 'mul',
+          'out_shape': {}
+        },
+        'minimum_0': {
+          'class': 'combine',
+          'from': ['mul', 'dim_value'],
+          'kind': 'minimum',
+          'out_shape': {}
+        },
+        'feature_masking': {
+          'class': 'subnetwork',
+          'from': [],
+          'subnetwork': {
+            'random': {
+              'class': 'subnetwork',
+              'from': [],
+              'subnetwork': {
+                'random': {
+                  'class': 'random',
+                  'shape': [
+                    batch_dim
+                  ],
+                  'distribution': 'uniform',
+                  'minval': 2,
+                  'maxval': 6,
+                  'dtype': 'int32',
+                },
+                'output': {
+                  'class': 'copy',
+                  'from': 'random',
+                  'out_shape': {batch_dim}
+                }
+              },
+              'out_shape': {batch_dim}
+            },
+            'random_0': {
+              'class': 'subnetwork',
+              'from': [],
+              'subnetwork': {
+                'random': {
+                  'class': 'random',
+                  'shape': [
+                    batch_dim,
+                    feat_dim
+                  ],
+                  'distribution': 'uniform',
+                  'minval': 0.0,
+                  'maxval': 1.0,
+                },
+                'output': {
+                  'class': 'copy',
+                  'from': 'random',
+                  'out_shape': {batch_dim, feat_dim}
+                }
+              },
+              'out_shape': {batch_dim, feat_dim}
+            },
+            'log': {
+              'class': 'activation',
+              'from': 'random_0',
+              'activation': 'log',
+              'out_shape': {batch_dim, feat_dim}
+            },
+            'negative': {
+              'class': 'activation',
+              'from': 'log',
+              'activation': 'negative',
+              'out_shape': {batch_dim, feat_dim}
+            },
+            'log_0': {
+              'class': 'activation',
+              'from': 'negative',
+              'activation': 'log',
+              'out_shape': {batch_dim, feat_dim}
+            },
+            'negative_0': {
+              'class': 'activation',
+              'from': 'log_0',
+              'activation': 'negative',
+              'out_shape': {batch_dim, feat_dim}
+            },
+            'reduce': {
+              'class': 'reduce',
+              'from': 'random',
+              'mode': 'max',
+              'axis': (batch_dim,),
+              'out_shape': {}
+            },
+            'top_k': {
+              'class': 'top_k',
+              'from': 'negative_0',
+              'axis': feat_dim,
+              'k': 'reduce',
+              'k_dim': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+              'sorted': True,
+              'out_shape': {batch_dim, specaugment_v2_cond_true_feature_masking_top_k_k_dim}
+            },
+            'loop': {
+              'class': 'rec',
+              'from': [],
+              'unit': {
+                'rec_unstack': {
+                  'class': 'rec_unstack',
+                  'from': 'base:range_in_axis',
+                  'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                  'out_shape': {}
+                },
+                'gather': {
+                  'class': 'gather',
+                  'from': 'base:top_k/indices',
+                  'position': 'rec_unstack',
+                  'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                  'out_shape': {batch_dim, ImplicitSparseDim(feat_dim)}
+                },
+                '_mask_v2': {
+                  'class': 'subnetwork',
+                  'from': [],
+                  'subnetwork': {
+                    'length': {
+                      'class': 'length',
+                      'from': 'base:prev:_mask_v2',
+                      'axis': feat_dim,
+                      'out_shape': {}
+                    },
+                    'random': {
+                      'class': 'subnetwork',
+                      'from': [],
+                      'subnetwork': {
+                        'random': {
+                          'class': 'random',
+                          'shape': (batch_dim,),
+                          'distribution': 'uniform',
+                          'minval': 1,
+                          'maxval': 11,
+                          'dtype': 'int32',
+                        },
+                        'output': {
+                          'class': 'copy',
+                          'from': 'random',
+                          'out_shape': {batch_dim}
+                        }
+                      },
+                      'out_shape': {batch_dim}
+                    },
+                    'add': {
+                      'class': 'combine',
+                      'from': ['base:gather', 'random'],
+                      'kind': 'add',
+                      'out_shape': {batch_dim, ImplicitSparseDim(feat_dim)}
+                    },
+                    'minimum': {
+                      'class': 'combine',
+                      'from': ['add', 'length'],
+                      'kind': 'minimum',
+                      'out_shape': {batch_dim, ImplicitSparseDim(feat_dim)}
+                    },
+                    'range_in_axis': {
+                      'class': 'range_in_axis',
+                      'from': 'base:prev:_mask_v2',
+                      'axis': feat_dim,
+                      'out_shape': {feat_dim}
+                    },
+                    'greater_equal': {
+                      'class': 'compare',
+                      'from': ['range_in_axis', 'base:gather'],
+                      'kind': 'greater_equal',
+                      'allow_broadcast_all_sources': True,
+                      'out_shape': {batch_dim, feat_dim}
+                    },
+                    'less': {
+                      'class': 'compare',
+                      'from': ['range_in_axis', 'minimum'],
+                      'kind': 'less',
+                      'allow_broadcast_all_sources': True,
+                      'out_shape': {batch_dim, feat_dim}
+                    },
+                    'logical_and': {
+                      'class': 'combine',
+                      'from': ['greater_equal', 'less'],
+                      'kind': 'logical_and',
+                      'out_shape': {batch_dim, feat_dim}
+                    },
+                    'where': {
+                      'class': 'switch',
+                      'condition': 'logical_and',
+                      'true_from': 0.0,
+                      'false_from': 'base:prev:_mask_v2',
+                      'out_shape': {batch_dim, time_dim, feat_dim}
+                    },
+                    'output': {
+                      'class': 'copy',
+                      'from': 'where',
+                      'out_shape': {batch_dim, time_dim, feat_dim}
+                    }
+                  },
+                  'initial_output': 'base:base:base:data',
+                  'need_last': True,
+                  'out_shape': {batch_dim, time_dim, feat_dim}
+                },
+                'output': {
+                  'class': 'copy',
+                  'from': 'rec_unstack',
+                  'out_shape': {}
+                }
+              },
+              'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+              'out_shape': {specaugment_v2_cond_true_feature_masking_top_k_k_dim},
+              'name_scope': ''
+            },
+            'range_in_axis': {
+              'class': 'range_in_axis',
+              'from': 'top_k/indices',
+              'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+              'out_shape': {specaugment_v2_cond_true_feature_masking_top_k_k_dim}
+            },
+            '_mask_v2': {
+              'class': 'rec_last_output',
+              'rec_layer': 'loop',
+              'sub_layer_name': '_mask_v2',
+              'out_shape': {batch_dim, time_dim, feat_dim}
+            },
+            'output': {
+              'class': 'copy',
+              'from': '_mask_v2',
+              'out_shape': {batch_dim, time_dim, feat_dim}
+            }
+          },
+          'out_shape': {batch_dim, time_dim, feat_dim}
+        },
+        'output': {
+          'class': 'copy',
+          'from': 'feature_masking',
+          'out_shape': {batch_dim, time_dim, feat_dim}
+        }
+      },
+      'out_shape': {batch_dim, time_dim, feat_dim}
+    },
+    'output': {
+      'class': 'copy',
+      'from': 'specaugment_v2',
+      'out_shape': {batch_dim, time_dim, feat_dim}
+    }
+  }
+
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    net.initialize_params(session)
+    session.run(net.get_default_output_layer().output.placeholder, feed_dict=make_feed_dict(net.extern_data))
+
+
+def test_specaugment_pure_returnn():
+  from returnn.tf.util.data import (
+    batch_dim, SpatialDim, FeatureDim, ImplicitDynSizeDim, ImplicitSparseDim)
+
+  time_dim = SpatialDim('time')
+  feat_dim = FeatureDim('feat', 50)
+
+  config = Config(dict(
+    extern_data={
+      'data': {
+        'dim_tags': (batch_dim, time_dim, feat_dim),
+        'dtype': 'float32',
+        'available_for_inference': True
+      }
+    },
+    debug_runtime_sanity_checks=True,
+  ))
+
+  specaugment_v2_cond_true_time_masking_top_k_k_dim = SpatialDim('specaugment_v2/cond/true/time_masking:top_k:k_dim')
+  specaugment_v2_cond_true_feature_masking_top_k_k_dim = SpatialDim(
+    'specaugment_v2/cond/true/feature_masking:top_k:k_dim')
+  random_state_dim = FeatureDim('random-state', 3)
+
+  net_dict = {
+    'specaugment_v2': {
+      'class': 'subnetwork',
+      'from': [],
+      'subnetwork': {
+        'ones': {'class': 'constant', 'value': True, 'shape': (), 'dtype': 'bool'},
+        'cond': {
+          'class': 'cond',
+          'from': [],
+          'condition': 'ones',
+          'true_layer': {
+            'class': 'subnetwork',
+            'from': [],
+            'subnetwork': {
+              'dim_value': {
+                'class': 'subnetwork',
+                'from': [],
+                'subnetwork': {
+                  'length': {
+                    'class': 'length',
+                    'from': 'base:base:base:data:data',
+                    'axis': time_dim,
+                    'out_shape': {batch_dim}
+                  },
+                  'reduce': {
+                    'class': 'reduce',
+                    'from': 'length',
+                    'mode': 'max',
+                    'axis': (batch_dim,),
+                    'out_shape': {}
+                  },
+                  'output': {
+                    'class': 'copy',
+                    'from': 'reduce',
+                    'out_shape': {}
+                  }
+                },
+                'out_shape': {}
+              },
+              'constant': {'class': 'constant', 'value': 2},
+              'minimum': {
+                'class': 'combine',
+                'from': ['constant', 'dim_value'],
+                'kind': 'minimum',
+                'out_shape': {}
+              },
+              'constant_0': {'class': 'constant', 'value': 100},
+              'floordiv': {
+                'class': 'combine',
+                'from': ['dim_value', 'constant_0'],
+                'kind': 'floordiv',
+                'out_shape': {}
+              },
+              'constant_1': {'class': 'constant', 'value': 2},
+              'maximum': {
+                'class': 'combine',
+                'from': ['floordiv', 'constant_1'],
+                'kind': 'maximum',
+                'out_shape': {}
+              },
+              'constant_2': {'class': 'constant', 'value': 4},
+              'mul': {
+                'class': 'combine',
+                'from': ['maximum', 'constant_2'],
+                'kind': 'mul',
+                'out_shape': {}
+              },
+              'minimum_0': {
+                'class': 'combine',
+                'from': ['mul', 'dim_value'],
+                'kind': 'minimum',
+                'out_shape': {}
+              },
+              'time_masking': {
+                'class': 'subnetwork',
+                'from': [],
+                'subnetwork': {
+                  'constant': {'class': 'constant', 'value': 1},
+                  'add': {
+                    'class': 'combine',
+                    'from': ['base:minimum_0', 'constant'],
+                    'kind': 'add',
+                    'out_shape': {}
+                  },
+                  'random': {
+                    'class': 'subnetwork',
+                    'from': [],
+                    'subnetwork': {
+                      'random': {
+                        'class': 'random',
+                        'shape': [
+                          batch_dim
+                        ],
+                        'distribution': 'uniform',
+                        'minval': 'base:base:minimum',
+                        'maxval': 'base:add',
+                        'dtype': 'int32',
+                        'explicit_state': 'base:base:base:random_state_var0_1',
+                        'auto_update_state': True
+                      },
+                      'output': {
+                        'class': 'copy',
+                        'from': 'random',
+                        'out_shape': {batch_dim}
+                      }
+                    },
+                    'out_shape': {batch_dim}
+                  },
+                  'random_0': {
+                    'class': 'subnetwork',
+                    'from': [],
+                    'subnetwork': {
+                      'random': {
+                        'class': 'random',
+                        'shape': [
+                          batch_dim,
+                          time_dim
+                        ],
+                        'distribution': 'uniform',
+                        'minval': 0.0,
+                        'maxval': 1.0,
+                        'explicit_state': 'base:base:base:random_0_state_var0_0',
+                        'auto_update_state': True
+                      },
+                      'output': {
+                        'class': 'copy',
+                        'from': 'random',
+                        'out_shape': {batch_dim, time_dim}
+                      }
+                    },
+                    'out_shape': {batch_dim, time_dim}
+                  },
+                  'log': {
+                    'class': 'activation',
+                    'from': 'random_0',
+                    'activation': 'log',
+                    'out_shape': {batch_dim, time_dim}
+                  },
+                  'negative': {
+                    'class': 'activation',
+                    'from': 'log',
+                    'activation': 'negative',
+                    'out_shape': {batch_dim, time_dim}
+                  },
+                  'log_0': {
+                    'class': 'activation',
+                    'from': 'negative',
+                    'activation': 'log',
+                    'out_shape': {batch_dim, time_dim}
+                  },
+                  'negative_0': {
+                    'class': 'activation',
+                    'from': 'log_0',
+                    'activation': 'negative',
+                    'out_shape': {batch_dim, time_dim}
+                  },
+                  'reduce': {
+                    'class': 'reduce',
+                    'from': 'random',
+                    'mode': 'max',
+                    'axis': (batch_dim,),
+                    'out_shape': {}
+                  },
+                  'top_k': {
+                    'class': 'top_k',
+                    'from': 'negative_0',
+                    'axis': time_dim,
+                    'k': 'reduce',
+                    'k_dim': specaugment_v2_cond_true_time_masking_top_k_k_dim,
+                    'sorted': True,
+                    'out_shape': {batch_dim, specaugment_v2_cond_true_time_masking_top_k_k_dim}
+                  },
+                  'loop': {
+                    'class': 'rec',
+                    'from': [],
+                    'unit': {
+                      'rec_unstack': {
+                        'class': 'rec_unstack',
+                        'from': 'base:range_in_axis',
+                        'axis': specaugment_v2_cond_true_time_masking_top_k_k_dim,
+                        'out_shape': {}
+                      },
+                      'gather': {
+                        'class': 'gather',
+                        'from': 'base:top_k/indices',
+                        'position': 'rec_unstack',
+                        'axis': specaugment_v2_cond_true_time_masking_top_k_k_dim,
+                        'out_shape': {batch_dim, ImplicitSparseDim(time_dim)}
+                      },
+                      '_mask_v2': {
+                        'class': 'subnetwork',
+                        'from': [],
+                        'subnetwork': {
+                          'length': {
+                            'class': 'length',
+                            'from': 'base:prev:_mask_v2',
+                            'axis': time_dim,
+                            'out_shape': {batch_dim}
+                          },
+                          'random': {
+                            'class': 'subnetwork',
+                            'from': [],
+                            'subnetwork': {
+                              'random': {
+                                'class': 'random',
+                                'shape': (batch_dim,),
+                                'distribution': 'uniform',
+                                'minval': 1,
+                                'maxval': 21,
+                                'dtype': 'int32',
+                                'explicit_state': 'base:base:base:base:base:random_state_var0_2',
+                                'auto_update_state': True
+                              },
+                              'output': {
+                                'class': 'copy',
+                                'from': 'random',
+                                'out_shape': {batch_dim}
+                              }
+                            },
+                            'out_shape': {batch_dim}
+                          },
+                          'add': {
+                            'class': 'combine',
+                            'from': ['base:gather', 'random'],
+                            'kind': 'add',
+                            'out_shape': {batch_dim, ImplicitSparseDim(time_dim)}
+                          },
+                          'minimum': {
+                            'class': 'combine',
+                            'from': ['add', 'length'],
+                            'kind': 'minimum',
+                            'out_shape': {batch_dim, ImplicitSparseDim(time_dim)}
+                          },
+                          'range_in_axis': {
+                            'class': 'range_in_axis',
+                            'from': 'base:prev:_mask_v2',
+                            'axis': time_dim,
+                            'out_shape': {ImplicitDynSizeDim(batch_dim), time_dim}
+                          },
+                          'greater_equal': {
+                            'class': 'compare',
+                            'from': ['range_in_axis', 'base:gather'],
+                            'kind': 'greater_equal',
+                            'allow_broadcast_all_sources': True,
+                            'out_shape': {batch_dim, time_dim}
+                          },
+                          'less': {
+                            'class': 'compare',
+                            'from': ['range_in_axis', 'minimum'],
+                            'kind': 'less',
+                            'allow_broadcast_all_sources': True,
+                            'out_shape': {batch_dim, time_dim}
+                          },
+                          'logical_and': {
+                            'class': 'combine',
+                            'from': ['greater_equal', 'less'],
+                            'kind': 'logical_and',
+                            'out_shape': {batch_dim, time_dim}
+                          },
+                          'where': {
+                            'class': 'switch',
+                            'condition': 'logical_and',
+                            'true_from': 0.0,
+                            'false_from': 'base:prev:_mask_v2',
+                            'out_shape': {batch_dim, time_dim, feat_dim}
+                          },
+                          'output': {
+                            'class': 'copy',
+                            'from': 'where',
+                            'out_shape': {batch_dim, time_dim, feat_dim}
+                          }
+                        },
+                        'initial_output': 'base:base:base:base:data:data',
+                        'need_last': True,
+                        'out_shape': {batch_dim, time_dim, feat_dim}
+                      },
+                      'output': {
+                        'class': 'copy',
+                        'from': 'rec_unstack',
+                        'out_shape': {}
+                      }
+                    },
+                    'axis': specaugment_v2_cond_true_time_masking_top_k_k_dim,
+                    'out_shape': {specaugment_v2_cond_true_time_masking_top_k_k_dim},
+                    'name_scope': ''
+                  },
+                  'range_in_axis': {
+                    'class': 'range_in_axis',
+                    'from': 'top_k/indices',
+                    'axis': specaugment_v2_cond_true_time_masking_top_k_k_dim,
+                    'out_shape': {specaugment_v2_cond_true_time_masking_top_k_k_dim}
+                  },
+                  '_mask_v2': {
+                    'class': 'rec_last_output',
+                    'rec_layer': 'loop',
+                    'sub_layer_name': '_mask_v2',
+                    'out_shape': {batch_dim, time_dim, feat_dim}
+                  },
+                  'output': {
+                    'class': 'copy',
+                    'from': '_mask_v2',
+                    'out_shape': {batch_dim, time_dim, feat_dim}
+                  }
+                },
+                'out_shape': {batch_dim, time_dim, feat_dim}
+              },
+              'feature_masking': {
+                'class': 'subnetwork',
+                'from': [],
+                'subnetwork': {
+                  'random': {
+                    'class': 'subnetwork',
+                    'from': [],
+                    'subnetwork': {
+                      'random': {
+                        'class': 'random',
+                        'shape': [
+                          batch_dim
+                        ],
+                        'distribution': 'uniform',
+                        'minval': 2,
+                        'maxval': 6,
+                        'dtype': 'int32',
+                        'explicit_state': 'base:base:base:random_state_var0',
+                        'auto_update_state': True
+                      },
+                      'output': {
+                        'class': 'copy',
+                        'from': 'random',
+                        'out_shape': {batch_dim}
+                      }
+                    },
+                    'out_shape': {batch_dim}
+                  },
+                  'random_0': {
+                    'class': 'subnetwork',
+                    'from': [],
+                    'subnetwork': {
+                      'random': {
+                        'class': 'random',
+                        'shape': [
+                          batch_dim,
+                          feat_dim
+                        ],
+                        'distribution': 'uniform',
+                        'minval': 0.0,
+                        'maxval': 1.0,
+                        'explicit_state': 'base:base:base:random_0_state_var0',
+                        'auto_update_state': True
+                      },
+                      'output': {
+                        'class': 'copy',
+                        'from': 'random',
+                        'out_shape': {batch_dim, feat_dim}
+                      }
+                    },
+                    'out_shape': {batch_dim, feat_dim}
+                  },
+                  'log': {
+                    'class': 'activation',
+                    'from': 'random_0',
+                    'activation': 'log',
+                    'out_shape': {batch_dim, feat_dim}
+                  },
+                  'negative': {
+                    'class': 'activation',
+                    'from': 'log',
+                    'activation': 'negative',
+                    'out_shape': {batch_dim, feat_dim}
+                  },
+                  'log_0': {
+                    'class': 'activation',
+                    'from': 'negative',
+                    'activation': 'log',
+                    'out_shape': {batch_dim, feat_dim}
+                  },
+                  'negative_0': {
+                    'class': 'activation',
+                    'from': 'log_0',
+                    'activation': 'negative',
+                    'out_shape': {batch_dim, feat_dim}
+                  },
+                  'reduce': {
+                    'class': 'reduce',
+                    'from': 'random',
+                    'mode': 'max',
+                    'axis': (batch_dim,),
+                    'out_shape': {}
+                  },
+                  'top_k': {
+                    'class': 'top_k',
+                    'from': 'negative_0',
+                    'axis': feat_dim,
+                    'k': 'reduce',
+                    'k_dim': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                    'sorted': True,
+                    'out_shape': {batch_dim, specaugment_v2_cond_true_feature_masking_top_k_k_dim}
+                  },
+                  'loop': {
+                    'class': 'rec',
+                    'from': [],
+                    'unit': {
+                      'rec_unstack': {
+                        'class': 'rec_unstack',
+                        'from': 'base:range_in_axis',
+                        'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                        'out_shape': {}
+                      },
+                      'gather': {
+                        'class': 'gather',
+                        'from': 'base:top_k/indices',
+                        'position': 'rec_unstack',
+                        'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                        'out_shape': {batch_dim, ImplicitSparseDim(feat_dim)}
+                      },
+                      '_mask_v2': {
+                        'class': 'subnetwork',
+                        'from': [],
+                        'subnetwork': {
+                          'length': {
+                            'class': 'length',
+                            'from': 'base:prev:_mask_v2',
+                            'axis': feat_dim,
+                            'out_shape': {}
+                          },
+                          'random': {
+                            'class': 'subnetwork',
+                            'from': [],
+                            'subnetwork': {
+                              'random': {
+                                'class': 'random',
+                                'shape': (batch_dim,),
+                                'distribution': 'uniform',
+                                'minval': 1,
+                                'maxval': 11,
+                                'dtype': 'int32',
+                                'explicit_state': 'base:base:base:base:base:random_state_var0_0',
+                                'auto_update_state': True
+                              },
+                              'output': {
+                                'class': 'copy',
+                                'from': 'random',
+                                'out_shape': {batch_dim}
+                              }
+                            },
+                            'out_shape': {batch_dim}
+                          },
+                          'add': {
+                            'class': 'combine',
+                            'from': ['base:gather', 'random'],
+                            'kind': 'add',
+                            'out_shape': {batch_dim, ImplicitSparseDim(feat_dim)}
+                          },
+                          'minimum': {
+                            'class': 'combine',
+                            'from': ['add', 'length'],
+                            'kind': 'minimum',
+                            'out_shape': {batch_dim, ImplicitSparseDim(feat_dim)}
+                          },
+                          'range_in_axis': {
+                            'class': 'range_in_axis',
+                            'from': 'base:prev:_mask_v2',
+                            'axis': feat_dim,
+                            'out_shape': {feat_dim}
+                          },
+                          'greater_equal': {
+                            'class': 'compare',
+                            'from': ['range_in_axis', 'base:gather'],
+                            'kind': 'greater_equal',
+                            'allow_broadcast_all_sources': True,
+                            'out_shape': {batch_dim, feat_dim}
+                          },
+                          'less': {
+                            'class': 'compare',
+                            'from': ['range_in_axis', 'minimum'],
+                            'kind': 'less',
+                            'allow_broadcast_all_sources': True,
+                            'out_shape': {batch_dim, feat_dim}
+                          },
+                          'logical_and': {
+                            'class': 'combine',
+                            'from': ['greater_equal', 'less'],
+                            'kind': 'logical_and',
+                            'out_shape': {batch_dim, feat_dim}
+                          },
+                          'where': {
+                            'class': 'switch',
+                            'condition': 'logical_and',
+                            'true_from': 0.0,
+                            'false_from': 'base:prev:_mask_v2',
+                            'out_shape': {batch_dim, time_dim, feat_dim}
+                          },
+                          'output': {
+                            'class': 'copy',
+                            'from': 'where',
+                            'out_shape': {batch_dim, time_dim, feat_dim}
+                          }
+                        },
+                        'initial_output': 'base:base:time_masking',
+                        'need_last': True,
+                        'out_shape': {batch_dim, time_dim, feat_dim}
+                      },
+                      'output': {
+                        'class': 'copy',
+                        'from': 'rec_unstack',
+                        'out_shape': {}
+                      }
+                    },
+                    'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                    'out_shape': {specaugment_v2_cond_true_feature_masking_top_k_k_dim},
+                    'name_scope': ''
+                  },
+                  'range_in_axis': {
+                    'class': 'range_in_axis',
+                    'from': 'top_k/indices',
+                    'axis': specaugment_v2_cond_true_feature_masking_top_k_k_dim,
+                    'out_shape': {specaugment_v2_cond_true_feature_masking_top_k_k_dim}
+                  },
+                  '_mask_v2': {
+                    'class': 'rec_last_output',
+                    'rec_layer': 'loop',
+                    'sub_layer_name': '_mask_v2',
+                    'out_shape': {batch_dim, time_dim, feat_dim}
+                  },
+                  'output': {
+                    'class': 'copy',
+                    'from': '_mask_v2',
+                    'out_shape': {batch_dim, time_dim, feat_dim}
+                  }
+                },
+                'out_shape': {batch_dim, time_dim, feat_dim}
+              },
+              'output': {
+                'class': 'copy',
+                'from': 'feature_masking',
+                'out_shape': {batch_dim, time_dim, feat_dim}
+              }
+            }
+          },
+          'false_layer': {
+            'class': 'subnetwork',
+            'from': [],
+            'subnetwork': {
+              'output': {
+                'class': 'copy',
+                'from': 'base:base:data:data',
+                'out_shape': {batch_dim, time_dim, feat_dim}
+              }
+            }
+          },
+          'out_shape': {batch_dim, time_dim, feat_dim},
+          'name_scope': ''
+        },
+        'random_state_init': {
+          'class': 'random_state_init',
+          'out_dim': random_state_dim,
+          'out_shape': {random_state_dim}
+        },
+        'random_state_init_0': {
+          'class': 'random_state_init',
+          'out_dim': random_state_dim,
+          'out_shape': {random_state_dim}
+        },
+        'random_state_init_1': {
+          'class': 'random_state_init',
+          'out_dim': random_state_dim,
+          'out_shape': {random_state_dim}
+        },
+        'random_state_init_2': {
+          'class': 'random_state_init',
+          'out_dim': random_state_dim,
+          'out_shape': {random_state_dim}
+        },
+        'random_state_init_3': {
+          'class': 'random_state_init',
+          'out_dim': random_state_dim,
+          'out_shape': {random_state_dim}
+        },
+        'random_state_init_4': {
+          'class': 'random_state_init',
+          'out_dim': random_state_dim,
+          'out_shape': {random_state_dim}
+        },
+        'output': {
+          'class': 'copy',
+          'from': 'cond',
+          'out_shape': {batch_dim, time_dim, feat_dim}
+        },
+        'random_state_var0': {
+          'class': 'variable',
+          'shape': [
+            random_state_dim
+          ],
+          'param_name': 'param',
+          'dtype': 'int64',
+          'init_by_layer': 'random_state_init_2'
+        },
+        'random_state_var0_0': {
+          'class': 'variable',
+          'shape': [
+            random_state_dim
+          ],
+          'param_name': 'param',
+          'dtype': 'int64',
+          'init_by_layer': 'random_state_init_4'
+        },
+        'random_0_state_var0': {
+          'class': 'variable',
+          'shape': [
+            random_state_dim
+          ],
+          'param_name': 'param',
+          'dtype': 'int64',
+          'init_by_layer': 'random_state_init_3'
+        },
+        'random_state_var0_1': {
+          'class': 'variable',
+          'shape': [
+            random_state_dim
+          ],
+          'param_name': 'param',
+          'dtype': 'int64',
+          'init_by_layer': 'random_state_init'
+        },
+        'random_state_var0_2': {
+          'class': 'variable',
+          'shape': [
+            random_state_dim
+          ],
+          'param_name': 'param',
+          'dtype': 'int64',
+          'init_by_layer': 'random_state_init_1'
+        },
+        'random_0_state_var0_0': {
+          'class': 'variable',
+          'shape': [
+            random_state_dim
+          ],
+          'param_name': 'param',
+          'dtype': 'int64',
+          'init_by_layer': 'random_state_init_0'
+        }
+      },
+      'out_shape': {batch_dim, time_dim, feat_dim}
+    },
+    'output': {
+      'class': 'copy',
+      'from': 'specaugment_v2',
+      'out_shape': {batch_dim, time_dim, feat_dim}
+    }
+  }
+
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    net.initialize_params(session)
+    session.run(net.get_default_output_layer().output.placeholder, feed_dict=make_feed_dict(net.extern_data))
+
+
 def test_SearchSortedLayer():
   n_batch, n_time, n_in, n_out = 2, 10, 3, 5
   random = numpy.random.RandomState(seed=1)
@@ -2885,6 +4393,101 @@ def test_CondLayer_subnetwork_train():
       from returnn.tf.network import help_on_tf_exception
       help_on_tf_exception(session=session, exception=exc, fetches=fetches, feed_dict=feed_dict)
       raise
+
+
+def test_CondLayer_subnet_template_construct():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+
+  time_dim = SpatialDim('time')
+  feat_dim = FeatureDim('feat', 5)
+
+  config = Config(dict(
+    extern_data={
+      'data': {
+        'dim_tags': (batch_dim, time_dim, feat_dim),
+        'dtype': 'float32',
+        'available_for_inference': True
+      }
+    },
+    debug_runtime_sanity_checks=True,
+    debug_print_layer_output_shape=True,
+    debug_print_layer_output=True,
+  ))
+
+  class _EvalFuncLocals:
+    graph_call_count = 0
+    session_call_count = 0
+
+  def _py_func(x):
+    _EvalFuncLocals.session_call_count += 1
+    return x
+
+  def _eval_func(source, **_kwargs):
+    _EvalFuncLocals.graph_call_count += 1
+    x = source(0)
+    y, = tf_compat.v1.py_func(_py_func, [x], [x.dtype], stateful=True)
+    y.set_shape(x.get_shape())
+    return y
+
+  net_dict = {
+    'specaugment_v2': {
+      'class': 'subnetwork',
+      'from': [],
+      'subnetwork': {
+        'train_flag': {'class': 'train_flag'},
+        'cond': {
+          'class': 'cond',
+          'from': [],
+          'condition': 'train_flag',
+          'true_layer': {
+            'class': 'subnetwork',
+            'from': [],
+            'subnetwork': {
+              'scores': {
+                "class": "reduce", "from": "base:base:data", "mode": "sum",
+                "axis": [batch_dim, time_dim, feat_dim],
+                "out_shape": {}
+              },
+              'output': {
+                'class': 'eval', "from": "scores", "eval": _eval_func
+              },
+            }
+          },
+          'false_layer': {
+            'class': 'subnetwork',
+            'from': [],
+            'subnetwork': {
+              'output': {
+                'class': 'constant', "value": -1., 'out_shape': {}
+              }
+            }
+          },
+          'name_scope': ''
+        },
+        "output": {"class": "copy", "from": "cond"},
+      },
+    },
+    'output': {
+      'class': 'copy',
+      'from': 'specaugment_v2',
+    }
+  }
+
+  with make_scope() as session:
+    train_flag = tf_util.get_global_train_flag_placeholder()
+    net = TFNetwork(config=config, train_flag=train_flag)
+    net.construct_from_dict(net_dict)
+    assert _EvalFuncLocals.graph_call_count == 1  # if more often, set a breakpoint above
+    net.initialize_params(session)
+    feed_dict = make_feed_dict(net.extern_data)
+    feed_dict[train_flag] = False
+    res_eval = session.run(net.get_default_output_layer().output.placeholder, feed_dict=feed_dict)
+    print("eval:", res_eval)
+    assert _EvalFuncLocals.session_call_count == 0
+    feed_dict[train_flag] = True
+    res_train = session.run(net.get_default_output_layer().output.placeholder, feed_dict=feed_dict)
+    print("train:", res_train)
+    assert _EvalFuncLocals.session_call_count == 1
 
 
 def test_ScatterNdLayer_RangeLayer():
@@ -3030,6 +4633,33 @@ def test_RepeatLayer_int_repetitions():
     assert out.batch_dim_axis == 0
     ref = numpy.swapaxes(numpy.repeat(input_data, 3, axis=-1), -1, out.feature_dim_axis)
     numpy.testing.assert_allclose(ref, v, rtol=1e-5)
+
+
+def test_RepeatLayer_int():
+  # https://github.com/rwth-i6/returnn_common/issues/162
+  from returnn.tf.util.data import batch_dim, SpatialDim
+  time_dim = SpatialDim('time')
+  config = Config({"extern_data": {"data": {"dim_tags": (batch_dim, time_dim), "dtype": "float32"}}})
+  _repeat_out_dim = time_dim * 5
+  net_dict = {
+    'output': {
+      'class': 'repeat',
+      'from': 'data:data',
+      'repetitions': 5,
+      'axis': time_dim,
+      'out_dim': _repeat_out_dim,
+      'out_shape': {batch_dim, _repeat_out_dim}
+    },
+  }
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    in_ = net.extern_data.data["data"]
+    out = net.get_default_output_layer().output
+    _, in_seq_len, _, out_seq_len = session.run(
+      (in_.placeholder, in_.get_sequence_lengths(), out.placeholder, out.get_sequence_lengths()),
+      feed_dict=make_feed_dict(net.extern_data))
+    assert (in_seq_len * 5 == out_seq_len).all()
 
 
 def test_TileLayer():
@@ -3230,6 +4860,81 @@ def test_rand_indices():
       feed_dict=make_feed_dict(net.extern_data, n_batch=n_batch, n_time=n_time))
     assert_equal(indices_flat.shape, (n_batch, n_time, sz[-1].dimension))
     assert_equal(output.shape, (n_batch, n_time, sz[-1].dimension, feature_dim.dimension))
+
+
+def test_RandomLayer_in_loop():
+  # https://github.com/rwth-i6/returnn/issues/1044
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+  time_dim = SpatialDim('time')
+  input_dim = FeatureDim('input', 3)
+  config = Config({"extern_data": {"data": {"dim_tags": (batch_dim, time_dim, input_dim)}}})
+  random_state_dim = FeatureDim('random-state', 3)
+  net_dict = {
+    'output': {
+      'class': 'rec',
+      'from': "data",
+      'unit': {
+        'rnd': {
+          'class': 'subnetwork',
+          'from': [],
+          'subnetwork': {
+            'random': {
+              'class': 'random',
+              'shape': [
+                batch_dim,
+                input_dim
+              ],
+              'distribution': 'normal',
+              'mean': 0.0,
+              'stddev': 1.0,
+              'explicit_state': 'base:base:rnd_state_var0',
+              'auto_update_state': True
+            },
+            'output': {
+              'class': 'copy',
+              'from': 'random',
+              'out_shape': {batch_dim, input_dim}
+            }
+          },
+          'out_shape': {batch_dim, input_dim}
+        },
+        'output': {
+          'class': 'eval',
+          'from': ['data:source', 'rnd'],
+          'eval': 'source(0) * 0.0 + source(1)',
+          'out_shape': {batch_dim, input_dim}
+        },
+      },
+      'axis': time_dim,
+      'out_shape': {batch_dim, time_dim, input_dim},
+      'name_scope': ''
+    },
+    'random_state_init': {
+      'class': 'random_state_init',
+      'out_dim': random_state_dim,
+      'out_shape': {random_state_dim}
+    },
+    'rnd_state_var0': {
+      'class': 'variable',
+      'shape': [
+        random_state_dim
+      ],
+      'param_name': 'param',
+      'dtype': 'int64',
+      'init_by_layer': 'random_state_init',
+      'name_scope': 'rnd/state_var0'
+    }
+  }
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    net.initialize_params(session)
+    out = net.get_default_output_layer().output.copy_as_time_major()
+    out_np = session.run(out.placeholder, feed_dict=make_feed_dict(net.extern_data))
+    print(out_np)
+    out0_np = out_np[:1]  # [1,B,D]
+    print((out0_np == out_np))
+    assert not (out0_np == out_np).all()  # not all the same
 
 
 def test_untrainable_params():
@@ -5524,6 +7229,98 @@ def test_loss_cross_entropy_as_is_optimize_flatten():
     session.run(loss, feed_dict=make_feed_dict(net.extern_data))
 
 
+def test_reduce_with_flatten():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+  time_dim = SpatialDim("time")
+  feature_dim = FeatureDim("feat", 1)
+  config = Config({"extern_data": {"data": {"dim_tags": (batch_dim, time_dim, feature_dim), "dtype": "float32"}}})
+  net_dict = {
+    'exp': {
+      'class': 'activation',
+      'from': 'data:data',
+      'activation': 'exp',
+      'out_shape': {batch_dim, time_dim, feature_dim}
+    },
+    'mean_absolute_difference': {
+      'class': 'subnetwork',
+      'from': [],
+      'subnetwork': {
+        'sub': {
+          'class': 'combine',
+          'from': ['base:exp', 'base:data:data'],
+          'kind': 'sub',
+          'out_shape': {batch_dim, time_dim, feature_dim}
+        },
+        'abs': {
+          'class': 'activation',
+          'from': 'sub',
+          'activation': 'abs',
+          'out_shape': {batch_dim, time_dim, feature_dim}
+        },
+        'reduce': {
+          'class': 'reduce',
+          'from': 'abs',
+          'mode': 'mean',
+          'axis': feature_dim,
+          'out_shape': {batch_dim, time_dim}
+        },
+        'output': {
+          'class': 'copy',
+          'from': 'reduce',
+          'out_shape': {batch_dim, time_dim}
+        }
+      },
+      'loss': 'as_is',
+      'out_shape': {batch_dim, time_dim},
+    },
+}
+  with make_scope():
+    net = TFNetwork(config=config, train_flag=True)
+    net.construct_from_dict(net_dict)
+    net.get_total_loss()
+
+
+def test_double_flatten_loss():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+  time_dim = SpatialDim("time")
+  _repeat_out_dim = time_dim * 5
+  feature_dim = FeatureDim("feat", 1)
+  config = Config({"extern_data": {"data": {"dim_tags": (batch_dim, time_dim, feature_dim), "dtype": "int32"}}})
+  network = {
+    'sub': {
+      'class': 'combine',
+      'from': ['data:data', 'data:data'],
+      'kind': 'sub',
+      'loss': 'as_is',
+      'out_shape': {batch_dim, time_dim, feature_dim}
+    },
+    'repeat': {
+      'class': 'repeat',
+      'from': 'sub',
+      'repetitions': 5,
+      'axis': time_dim,
+      'out_dim': _repeat_out_dim,
+      'out_shape': {batch_dim, feature_dim, _repeat_out_dim}
+    },
+    'sub_0': {
+      'class': 'combine',
+      'from': ['repeat', 'repeat'],
+      'kind': 'sub',
+      'loss': 'as_is',
+      'out_shape': {batch_dim, feature_dim, _repeat_out_dim}
+    },
+    'output': {
+      'class': 'copy',
+      'from': 'sub_0',
+      'out_shape': {batch_dim, feature_dim, _repeat_out_dim}
+    }
+  }
+  with make_scope():
+    net = TFNetwork(config=config, train_flag=True)
+    net.construct_from_dict(network)
+    net.get_total_loss()
+
+
 def test_LossLayer_sublayers():
   from returnn.tf.util.basic import Dim
   n_in, n_out = 7, 11
@@ -5623,6 +7420,106 @@ def test_LossLayer_sublayers():
     session.run(tf_compat.v1.global_variables_initializer())
     results = session.run(fetches_dict, feed_dict=feed_dict)
     pprint(results)
+
+
+def test_EditDistanceLayer_greedy_ctc_decode():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+  input_spatial_dim = SpatialDim("input-spatial")
+  targets_spatial_dim = SpatialDim("targets-spatial")
+  classes_dim = FeatureDim("classes", 10)
+  blank_idx = classes_dim.dimension
+  config = Config({
+    "extern_data": {
+      "logits": {"dim_tags": [batch_dim, input_spatial_dim, classes_dim + 1]},
+      "targets": {"dim_tags": [batch_dim, targets_spatial_dim], "sparse_dim": classes_dim},
+    },
+  })
+  net_dict = {
+    "argmax": {"class": "reduce", "from": "data:logits", "axis": "F", "mode": "argmax"},
+    "ctc_decode": {"class": "subnetwork", "from": "argmax", "subnetwork": {
+      # tf_util.sparse_labels_with_seq_lens
+      "shift_right": {
+        "class": "shift_axis", "from": "data", "axis": "T", "amount": 1, "pad_value": -1, "adjust_size_info": False},
+      "unique_mask": {
+        "class": "compare", "from": ["data", "shift_right"], "kind": "not_equal"},
+      "non_blank_mask": {
+        "class": "compare", "from": "data", "kind": "not_equal", "value": blank_idx},
+      "mask": {"class": "combine", "kind": "logical_and", "from": ["unique_mask", "non_blank_mask"]},
+      "output": {
+        "class": "masked_computation", "from": "data", "mask": "mask",
+        "unit": {"class": "copy", "from": "data"}},
+    }},
+    "edit_dist": {"class": "edit_distance", "a": "ctc_decode", "b": "data:targets", "is_output_layer": True},
+  }
+
+  with make_scope() as session:
+    network = TFNetwork(config=config, train_flag=True)
+    network.construct_from_dict(net_dict)
+
+    logits = network.extern_data.data["logits"]
+    targets = network.extern_data.data["targets"]
+    decoded_sparse = tf_util.ctc_greedy_decode(
+      logits=logits.get_placeholder_as_time_major(), seq_lens=logits.get_sequence_lengths(), time_major=True)
+    decoded_dense = tf_compat.v1.sparse_to_dense(
+      sparse_indices=decoded_sparse.indices,
+      sparse_values=decoded_sparse.values,
+      output_shape=decoded_sparse.dense_shape)
+    targets_sparse = tf_util.sparse_labels(targets.placeholder, seq_lens=targets.get_sequence_lengths())
+    error = tf.edit_distance(
+      hypothesis=tf.cast(decoded_sparse, targets_sparse.dtype), truth=targets_sparse, normalize=False)
+
+    argmax = network.layers["argmax"].output
+    decoded_net = network.layers["ctc_decode"].output
+    print("decoded out:", decoded_net)
+    error_net = network.layers["edit_dist"].output
+    print("error out:", error_net)
+
+    n_batch = 5
+    n_logits_time = 20
+    n_targets_time = 7
+    rnd = numpy.random.RandomState(42)
+    targets_np = rnd.randint(low=0, high=classes_dim.dimension, size=(n_batch, n_targets_time))
+    targets_sizes = [7, 6, 5, 4, 3]
+    logits_np = rnd.uniform(size=(n_batch, n_logits_time, classes_dim.dimension + 1)).astype("float32")
+    for b in range(n_batch):
+      # Random correct.
+      for _ in range(rnd.randint(1, 7)):
+        size = rnd.randint(1, 6)
+        t = rnd.randint(0, n_logits_time - size + 1)
+        logits_np[b, t:t + size, targets_np[b, rnd.randint(0, targets_sizes[b])]] = rnd.uniform(1., 2.)
+      # Random repeats.
+      for _ in range(rnd.randint(1, 5)):
+        size = rnd.randint(1, 6)
+        t = rnd.randint(0, n_logits_time - size + 1)
+        logits_np[b, t:t + size] = logits_np[b, t:t+1]
+      # Random blanks.
+      for _ in range(rnd.randint(1, 5)):
+        size = rnd.randint(1, 6)
+        t = rnd.randint(0, n_logits_time - size + 1)
+        logits_np[b, t:t + size, blank_idx] = rnd.uniform(1., 2.)
+    logits_sizes = [20, 19, 18, 17, 16]
+    feed_dict = {
+      logits.placeholder: logits_np,
+      logits.get_sequence_lengths(): logits_sizes,
+      targets.placeholder: targets_np,
+      targets.get_sequence_lengths(): targets_sizes,
+    }
+    argmax_np, dec1_np, err1_np, dec2_np, dec2_sizes, err2_np = session.run(
+      (argmax.placeholder,
+       decoded_dense, error,
+       decoded_net.get_placeholder_as_batch_major(), decoded_net.get_sequence_lengths(),
+       error_net.placeholder),
+      feed_dict=feed_dict)
+    print("targets:", targets_np)
+    print("targets sizes:", targets_sizes)
+    print("argmax:", argmax_np)
+    print("decoded ref:", dec1_np)
+    print("error ref:", err1_np)
+    print("decoded:", dec2_np)
+    print("decoded sizes:", dec2_sizes)
+    print("error:", err2_np)
+    numpy.testing.assert_array_equal(dec1_np, dec2_np)
+    numpy.testing.assert_array_equal(err1_np, err2_np)
 
 
 def test_param_variational_noise():

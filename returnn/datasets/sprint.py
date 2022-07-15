@@ -24,7 +24,7 @@ from returnn.datasets.basic import Dataset, DatasetSeq
 from .cached2 import CachedDataset2
 from returnn.log import log
 from returnn.util.task_system import Unpickler, numpy_copy_and_set_unused
-from returnn.util.basic import eval_shell_str, interrupt_main, unicode, PY3, BytesIO
+from returnn.util.basic import eval_shell_str, interrupt_main, unicode, PY3, BytesIO, close_all_fds_except
 
 
 class SprintDatasetBase(Dataset):
@@ -725,6 +725,7 @@ class ExternSprintDataset(SprintDatasetBase):
         sys.stdin.close()  # Force no tty stdin.
         self.pipe_c2p[0].close()
         self.pipe_p2c[1].close()
+        close_all_fds_except([0, 1, 2, self.pipe_c2p[1].fileno(), self.pipe_p2c[0].fileno()])
         os.execv(args[0], args)  # Does not return if successful.
         print("%s child exec failed." % self)
       except BaseException:
@@ -1140,9 +1141,9 @@ class SprintCacheDataset(CachedDataset2):
     assert not seq_list and not seq_order
     need_reinit = self.epoch is None or self.epoch != epoch
     super(SprintCacheDataset, self).init_seq_order(epoch=epoch, seq_list=seq_list, seq_order=seq_order)
+    self._num_seqs = len(self.seq_list_ordered)
     if not need_reinit:
       return False
-    self._num_seqs = len(self.seq_list_original)
     data0 = self.data["data"]
     assert isinstance(data0, self.SprintCacheReader)
 
@@ -1159,6 +1160,7 @@ class SprintCacheDataset(CachedDataset2):
         return data0.sprint_cache.files[seq_tag].ft[seq_tag].size
     seq_index = self.get_seq_order_for_epoch(epoch, self.get_total_num_seqs(), get_seq_len=get_seq_size)
     self.seq_list_ordered = [self.seq_list_original[s] for s in seq_index]
+    self._num_seqs = len(self.seq_list_ordered)
     return True
 
   def get_dataset_seq_for_name(self, name, seq_idx=-1):

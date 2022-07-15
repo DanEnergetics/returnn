@@ -1202,12 +1202,46 @@ def test_Data_copy_move_axis_time_to_end():
   assert d2.shape == (None, 4, None) and d2.feature_dim_axis == 2 and d2.time_dim_axis == 3
 
 
+def test_Data_template_from_constant_bool():
+  value = False
+  out = Data.template_from_constant(
+    value, name="bool_const", shape=None, dtype=None, with_batch_dim=False, sparse_dim=None)
+  assert out.batch_shape == ()
+  assert out.dtype == "bool"
+
+
 def test_Dim_copy():
   # https://github.com/rwth-i6/returnn/issues/860
   import copy
   a = SpatialDim("a")
   assert a == copy.copy(a)
   assert a == copy.deepcopy(a)
+
+
+def test_ExternData_ext_Data_batch_info():
+  # https://github.com/rwth-i6/returnn_common/issues/193
+  # https://github.com/rwth-i6/returnn/issues/975
+  from returnn.tf.util.data import Data, BatchInfo, SpatialDim, FeatureDim, batch_dim
+  from returnn.tf.network import ExternData
+  time_dim = SpatialDim("time")
+  in_dim = FeatureDim("in", 3)
+  x = Data("x", dim_tags=[batch_dim, time_dim, in_dim])
+  # This is how it is done in returnn-common construction, to set a custom dummy batch info.
+  # There is no reason why this should not be fine; we want that this is supported.
+  x.batch = BatchInfo.make_global_batch_info(-1)
+  x.sanity_check()  # still fine
+
+  with tf.Graph().as_default() as graph, tf_compat.v1.Session(graph=graph) as session:
+    data = Data("x", dim_tags=[batch_dim, time_dim, in_dim], auto_create_placeholders=True)
+    extern_data = ExternData()
+    extern_data.data["x"] = data
+    extern_data.init_batch_info()
+    data.sanity_check()
+    assert data.batch != x.batch
+
+    x.sanity_check()  # failed earlier due to dim tag batch info mismatch
+    assert not x.dim_tags[1].dyn_size_ext
+    assert data.dim_tags[1].dyn_size_ext
 
 
 def test_dim_math_basics():
@@ -2290,6 +2324,14 @@ def test_variable_summaries():
   session.run(v.initializer)
   session.run(tf_compat.v1.summary.merge_all())
   assert_almost_equal(session.run(variable_scalar_summaries_dict(v)["test_variable_summaries_mean"]), -0.5)
+
+
+def test_get_variable_from_tensor():
+  var = tf.Variable(initial_value=[[1.0, 2.0], [-4.0, -1.0]], name="test_get_variable_from_tensor")
+  x = tf.identity(var)
+  print_graph_output(x)
+  var_ = get_variable_from_tensor(x)
+  assert var_ is var
 
 
 def test_VariableAssigner():

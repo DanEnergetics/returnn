@@ -507,24 +507,49 @@ class LayerBase(object):
     from ..network import ExternData
     if output.have_batch_axis():
       if not output.batch:
+        def _set_global_batch_by_data(data):
+          """
+          :param Data data:
+          :rtype: returnn.tf.util.data.BatchInfo
+          """
+          assert data.placeholder is not None and not data.beam
+          # Create dummy extern data with new global batch info.
+          extern_data = ExternData()
+          extern_data.data["_fixup_out_data_dummy_input_" + data.name] = data
+          assert data.available_for_inference
+          extern_data.init_batch_info()  # this should create it and also set it
+          assert data.batch
+          return data.batch
+
         # Some heuristic for now to fix missing batch info. We should try to fix get_out_data_from_opts though...
         dep_layers = [v for v in nest.flatten(kwargs) if isinstance(v, LayerBase)]
         dep_batches = [dep.output.batch for dep in dep_layers if dep.output.batch]
+        dyn_dim_tags_with_batch = [
+          dim_tag for dim_tag in output.dim_tags
+          if dim_tag.dyn_size_ext and dim_tag.dyn_size_ext.have_batch_axis()]
+        dim_tags_with_batch_info = [dim_tag for dim_tag in output.dim_tags if dim_tag.batch]
         if dep_batches:
           output.batch = BatchInfo.get_common_batch_info(dep_batches).copy_set_beam(output.beam)
         elif network.extern_data.data:
           output.batch = network.extern_data.get_batch_info().copy_set_beam(output.beam)
         elif network.parent_net and network.get_root_network().extern_data.data:
           output.batch = network.get_root_network().extern_data.get_batch_info().copy_set_beam(output.beam)
+        elif dim_tags_with_batch_info:
+          output.batch = dim_tags_with_batch_info[0].batch.copy_set_beam(output.beam)
+        elif dyn_dim_tags_with_batch:
+          for tag in dyn_dim_tags_with_batch:
+            if tag.dyn_size_ext.batch:
+              output.batch = tag.dyn_size_ext.batch.copy_set_beam(output.beam)
+              break
+            batch_dim_tag = tag.dyn_size_ext.dim_tags[tag.dyn_size_ext.batch_dim_axis]
+            if batch_dim_tag.batch:
+              output.batch = batch_dim_tag.batch
+              break
+          if not output.batch:
+            output.batch = _set_global_batch_by_data(dyn_dim_tags_with_batch[0].dyn_size_ext)
         else:
           # No layers at all yet. This implies that the output must already have a placeholder.
-          assert output.placeholder is not None and not output.beam
-          # Create dummy extern data with new global batch info.
-          extern_data = ExternData()
-          extern_data.data[output.name] = output
-          assert output.available_for_inference
-          extern_data.init_batch_info()  # this should create it and also set it
-          assert output.batch
+          output.batch = _set_global_batch_by_data(output)
       output.batch = output.batch.copy_set_beam(output.beam)
     if output.control_flow_ctx != network.get_control_flow_ctx():
       x = output.placeholder
@@ -658,12 +683,17 @@ class LayerBase(object):
       inside_rec_time_dim = network.get_inside_rec_time_dim(inside_loop=True)
       over_rec_time_dim = network.get_inside_rec_time_dim(inside_loop=False)
       if over_rec_time_dim and not inside_rec_time_dim:  # moved out of loop
-        from returnn.tf.util.data import OptionalDim
+        # noinspection PyProtectedMember
+        from returnn.tf.util.data import OptionalDim, _MarkedDim
         out_shape = d["out_shape"]
         if not isinstance(out_shape, set):
           assert not out_shape, "out_shape %r must be empty if not a set" % (out_shape,)
-          out_shape = set()
+        out_shape = set(out_shape)
         out_shape.add(OptionalDim(over_rec_time_dim))
+        if over_rec_time_dim.dyn_size_ext:
+          for tag in over_rec_time_dim.dyn_size_ext.dim_tags:
+            if tag not in [d.tag if isinstance(d, _MarkedDim) else d for d in out_shape]:
+              out_shape.add(OptionalDim(tag))
         d["out_shape"] = out_shape
     if d.pop("loss_only_on_non_search", None) and network.search_flag:
       d.pop("loss", None)
@@ -846,7 +876,7 @@ class LayerBase(object):
       return self._is_output_layer
     if self.loss:
       return True
-    if self.name == "output":
+    if self.get_full_ctx_name() == "output":
       return True
     return False
 
@@ -992,7 +1022,11 @@ class LayerBase(object):
 
      * the param sharing logic, to reuse existing variables from elsewhere
      * variational noise
-     * Note: :func:`default_control_flow_ctx` should not be needed, as tf.get_variable should always work
+     * Note: :func:`default_control_flow_ctx` is not needed for tf.get_variable.
+       But it might be needed for other code which uses custom inits and tf.Variable,
+       e.g. tf.random.Generator.
+       However, always using this could be a problem if we use other input tensors inside this scope,
+       so we do not enable this here.
 
     :param kwargs: passed to variable_scope
     :return: yields the variable_scope
@@ -1101,11 +1135,11 @@ class LayerBase(object):
       param = possible_params[0]
     assert isinstance(param, tf.Variable)
     if not self.trainable:
-      trainable_collection_ref = param.graph.get_collection_ref(tf_compat.v1.GraphKeys.TRAINABLE_VARIABLES)
+      trainable_collection_ref = tf_compat.v1.get_collection_ref(tf_compat.v1.GraphKeys.TRAINABLE_VARIABLES)
       if param in trainable_collection_ref:
         trainable_collection_ref.remove(param)
     if trainable is None:
-      trainable = param in param.graph.get_collection_ref(tf_compat.v1.GraphKeys.TRAINABLE_VARIABLES)
+      trainable = param in tf_compat.v1.get_collection_ref(tf_compat.v1.GraphKeys.TRAINABLE_VARIABLES)
     if saveable is None:
       saveable = True
     if custom_update:
@@ -1608,7 +1642,8 @@ class LayerBase(object):
       if isinstance(op, tf.Tensor):
         op = op.op
       # Make sure we update after we calculated the batch norm.
-      tf_util.add_control_input(op, control_input=bn.op)
+      if not tf_compat.executing_eagerly():
+        tf_util.add_control_input(op, control_input=bn.op)
       self.network.register_post_control_dependencies([op])
       if not use_fused:
         if use_std:
@@ -2374,14 +2409,30 @@ class Loss(object):
   recurrent = False  # if this is a frame-wise criteria, this will be False
   need_target = True
 
-  def __init__(self, base_network, use_flatten_frames=True,
-               use_normalized_loss=False, custom_norm_factor=None,
+  def __init__(self, base_network,
+               use_flatten_frames=True,
+               use_normalized_loss=False,
+               custom_norm_factor=None,
+               custom_inv_norm_factor=None,
                scale=1.0):
     """
     :param returnn.tf.network.TFNetwork base_network:
     :param bool use_flatten_frames: will use :func:`returnn.tf.util.basic.flatten_with_seq_len_mask`
     :param bool use_normalized_loss: the loss used in optimization will be normalized
     :param float|function|None custom_norm_factor:
+      The standard norm factor is 1/sum(target_seq_len) if the target has a time-axis,
+      or 1/sum(output_seq_len) if there is no target and the output has a time-axis,
+      or 1 otherwise. (See :func:`Loss.init` for details.)
+      This is used for proper normalization of accumulated loss/error per epoch
+      and also proper normalization per batch for reporting,
+      no matter if use_normalized_loss is True or False.
+      If you want to change this norm factor, you can set this.
+      As a function, it takes (self=self, output=output, layer=layer) and returns a float scalar.
+    :param LayerBase|None custom_inv_norm_factor: inverse of custom_norm_factor.
+      Here we allow to pass a layer.
+      Here we also allow to pass any shape and it will automatically be reduced via sum.
+      So you could simply pass target_seq_len directly here.
+      Basically, for all reporting, it uses sum(loss) * sum(custom_inv_norm_factor).
     :param float scale: additional scale factor for the loss
     """
     self.base_network = base_network
@@ -2397,9 +2448,14 @@ class Loss(object):
     self.output_before_softmax_flat = None  # type: typing.Optional[tf.Tensor]
     self.target_flat = None  # type: typing.Optional[tf.Tensor]
     # Maybe make configurable. For now, same as in our Theano behavior.
+    # The loss_norm_factor is used by Runner._normalize_loss both for normalization per epoch and per batch.
+    # It is e.g. set to 1/sum(target_seq_len), and logic of accumulation is handled in the Runner.
     self.loss_norm_factor = None  # type: typing.Optional[tf.Tensor]
-    self.use_normalized_loss = use_normalized_loss
+    self.use_normalized_loss = use_normalized_loss  # for the optimizer, per batch
     self.custom_norm_factor = custom_norm_factor
+    self.custom_inv_norm_factor = custom_inv_norm_factor
+    if custom_inv_norm_factor:
+      assert custom_norm_factor is None, "%s: do not provide both custom_norm_factor and custom_inv_norm_factor" % self
     self.scale = scale
 
   def __repr__(self):
@@ -2484,6 +2540,8 @@ class Loss(object):
     Mostly leaves `d` as-is.
     This is used by `LayerBase.transform_config_dict`.
     """
+    if d.get("custom_inv_norm_factor", None) is not None:
+      d["custom_inv_norm_factor"] = get_layer(d["custom_inv_norm_factor"])
 
   def init_by_layer(self, layer, layer_output_template=None):
     """
@@ -2591,6 +2649,8 @@ class Loss(object):
         else:
           assert isinstance(self.custom_norm_factor, float)
           self.loss_norm_factor = self.custom_norm_factor
+      if self.custom_inv_norm_factor:
+        self.loss_norm_factor = 1.0 / tf.cast(tf.reduce_sum(self.custom_inv_norm_factor.output.placeholder), tf.float32)
       self._check_init()
 
   def _check_init(self):

@@ -1038,7 +1038,7 @@ def dict_joined(*ds):
   return res
 
 
-def obj_diff_str(self, other):
+def obj_diff_str(self, other, **kwargs):
   """
   :param object self:
   :param object other:
@@ -1053,6 +1053,9 @@ def obj_diff_str(self, other):
     return "other is None and self is %r" % self
   if self == other:
     return "No diff."
+  name = kwargs.pop("attr_type_name", "attrib")  # or "item"
+  if kwargs:
+    raise TypeError("obj_diff_str: invalid kwargs %r" % kwargs)
   s = []
 
   def _obj_attribs(obj):
@@ -1075,26 +1078,26 @@ def obj_diff_str(self, other):
   if self_attribs is None or other_attribs is None:
     return "self: %r, other: %r" % (self, other)
   for attrib in sorted(set(self_attribs).union(other_attribs)):
-    value_self = getattr(self, attrib, not_specified)
-    value_other = getattr(other, attrib, not_specified)
+    value_self = self.__dict__.get(attrib, not_specified)
+    value_other = other.__dict__.get(attrib, not_specified)
     if isinstance(value_self, list):
       if not isinstance(value_other, list):
-        s += ["attrib %r self is list but other is %r" % (attrib, type(value_other))]
+        s += ["%s %r self is list but other is %r" % (name, attrib, type(value_other))]
       elif len(value_self) != len(value_other):
-        s += ["attrib %r list differ. len self: %i, len other: %i" % (attrib, len(value_self), len(value_other))]
+        s += ["%s %r list differ. len self: %i, len other: %i" % (name, attrib, len(value_self), len(value_other))]
       else:
         for i, (a, b) in enumerate(zip(value_self, value_other)):
           if a != b:
-            s += ["attrib %r[%i] differ. self: %r, other: %r" % (attrib, i, a, b)]
+            s += ["%s %r[%i] differ. self: %r, other: %r" % (name, attrib, i, a, b)]
     elif isinstance(value_self, dict):
       if not isinstance(value_other, dict):
-        s += ["attrib %r self is dict but other is %r" % (attrib, type(value_other))]
+        s += ["%s %r self is dict but other is %r" % (name, attrib, type(value_other))]
       elif value_self != value_other:
-        s += ["attrib %r dict differs:" % attrib]
+        s += ["%s %r dict differs:" % (name, attrib)]
         s += ["  " + line for line in dict_diff_str(value_self, value_other).splitlines()]
     else:
       if value_self != value_other:
-        s += ["attrib %r differ. self: %r, other: %r" % (attrib, value_self, value_other)]
+        s += ["%s %r differ. self: %r, other: %r" % (name, attrib, value_self, value_other)]
   if s:
     return "\n".join(s)
   else:
@@ -1108,7 +1111,7 @@ def dict_diff_str(self, other):
   :return: the difference described
   :rtype: str
   """
-  return obj_diff_str(DictAsObj(self), DictAsObj(other))
+  return obj_diff_str(DictAsObj(self), DictAsObj(other), attr_type_name="item")
 
 
 def find_ranges(ls):
@@ -2193,14 +2196,18 @@ def make_hashable(obj):
   """
   if isinstance(obj, dict):
     return FrozenDict([make_hashable(item) for item in obj.items()])
-  elif isinstance(obj, (list, tuple)):
+  if isinstance(obj, (list, tuple)):
     return tuple([make_hashable(item) for item in obj])
-  elif isinstance(obj, (str, unicode, float, int, long)):
+  if isinstance(obj, (str, unicode, float, int, long)):
     return obj
-  elif obj is None:
+  if obj is None:
     return obj
-  else:
-    assert False, "don't know how to make hashable: %r (%r)" % (obj, type(obj))
+  if "tensorflow" in sys.modules:
+    import tensorflow as tf
+    from returnn.tf.util import basic as tf_util
+    if isinstance(obj, tf.Tensor):
+      return tf_util.TensorRef(obj)
+  assert False, "don't know how to make hashable: %r (%r)" % (obj, type(obj))
 
 
 def make_dll_name(basename):
@@ -3725,6 +3732,27 @@ def maybe_restart_returnn_with_atfork_patch():
   sys.stdout.flush()
   os.execvpe(sys.executable, [sys.executable] + sys.argv, env)
   print("execvpe did not work?")
+
+
+def close_all_fds_except(except_fds):
+  """
+  Calls os.closerange except for the given fds.
+  Code adopted and extended from multiprocessing.util.close_all_fds_except.
+
+  :param typing.Collection[int] except_fds: usually at least {0,1,2}
+  """
+  # noinspection PyBroadException
+  try:
+    max_fd = os.sysconf("SC_OPEN_MAX")
+  except Exception:
+    max_fd = 256
+
+  except_fds = sorted(list(except_fds) + [-1, max_fd])
+  assert except_fds[0] == -1 and except_fds[-1] == max_fd, 'fd invalid'
+
+  for i in range(len(except_fds) - 1):
+    if except_fds[i] + 1 < except_fds[i + 1]:
+      os.closerange(except_fds[i] + 1, except_fds[i + 1])
 
 
 class Stats:
