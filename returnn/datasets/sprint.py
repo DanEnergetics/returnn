@@ -1113,7 +1113,7 @@ class SprintCacheDataset(CachedDataset2):
   
   @property
   def num_seqs(self):
-    return len(self.seq_list_original)
+    return len(self.seq_list_ordered)
 
   def _check_matching_content_list(self):
     data0 = self.data["data"]
@@ -1157,7 +1157,7 @@ class SprintCacheDataset(CachedDataset2):
       except AttributeError:
         # sprint_cache is FileArchiveBundle
         return data0.sprint_cache.files[seq_tag].ft[seq_tag].size
-    seq_index = self.get_seq_order_for_epoch(epoch, self.num_seqs, get_seq_len=get_seq_size)
+    seq_index = self.get_seq_order_for_epoch(epoch, self.get_total_num_seqs(), get_seq_len=get_seq_size)
     self.seq_list_ordered = [self.seq_list_original[s] for s in seq_index]
     return True
 
@@ -1179,7 +1179,11 @@ class SprintCacheDataset(CachedDataset2):
     if seq_idx >= self.num_seqs:
       return None
     seq_tag = self.get_tag(seq_idx)  # type: str
-    return self.get_dataset_seq_for_name(seq_idx=seq_idx, name=seq_tag)
+    try:
+      return self.get_dataset_seq_for_name(seq_idx=seq_idx, name=seq_tag)
+    except IndexError:
+      # handle case if something goes wrong with num_seqs
+      return None
 
   def get_data_keys(self):
     """
@@ -1191,13 +1195,28 @@ class SprintCacheDataset(CachedDataset2):
     """
     :rtype: list[str]
     """
-    return [key for (key, d) in self.data if d.type == "align"]
+    return [key for (key, d) in self.data.items() if d.type == "align"]
 
   def get_tag(self, sorted_seq_idx):
     """
     :rtype: str
     """
     return self.seq_list_ordered[sorted_seq_idx]
+  
+  def get_all_tags(self):
+    """
+    :rtype: list[str]
+    """
+    return self.seq_list_original
+
+  def get_total_num_seqs(self):
+    """
+    :return: total number of seqs, without partition epoch.
+      Should be the same as len(self.get_all_tags()).
+      Note that this is not possible with all datasets.
+    :rtype: int
+    """
+    return len(self.seq_list_original)
 
 
 def demo():

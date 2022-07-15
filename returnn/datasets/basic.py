@@ -473,20 +473,20 @@ class Dataset(object):
       seq_index = [
         i for i in seq_index
         if (all_seq_tags[i] not in used_seq_tags, used_seq_tags.add(all_seq_tags[i]))[0]]
-    if partition_epoch > 1:
-      seq_index = self._apply_partition_epoch(seq_index, partition_epoch, epoch)
-    if repeat_epoch > 1:
-      seq_index = list(seq_index) * repeat_epoch
     if self.seq_tags_filter is not None:
       # Note: This is as generic as possible, but requires that get_all_tags is implemented.
       assert list(seq_index)
       all_seq_tags = self.get_all_tags()
-      assert len(all_seq_tags) == num_seqs # == self.get_total_num_seqs(), "%r vs %r vs %r" % (
-        # len(all_seq_tags), num_seqs, self.get_total_num_seqs())
+      assert len(all_seq_tags) == num_seqs == self.get_total_num_seqs(), "%r vs %r vs %r" % (
+        len(all_seq_tags), num_seqs, self.get_total_num_seqs())
       old_seq_index = seq_index
       seq_index = [i for i in seq_index if all_seq_tags[i] in self.seq_tags_filter]
       assert seq_index, "%s: empty after applying seq_list_filter_file. Example filter tags: %r, used tags: %r" % (
         self, sorted(self.seq_tags_filter)[:3], [all_seq_tags[i] for i in old_seq_index[:3]])
+    if partition_epoch > 1:
+      seq_index = self._apply_partition_epoch(seq_index, partition_epoch, epoch)
+    if repeat_epoch > 1:
+      seq_index = list(seq_index) * repeat_epoch
     return seq_index
 
   @classmethod
@@ -687,12 +687,10 @@ class Dataset(object):
       Note that this is not possible with all datasets.
     :rtype: int
     """
-    # if self.partition_epoch == 1:
+    if self.partition_epoch == 1:
       # Note: self.num_seqs might not always be set, or even be correct...
-    try:
       return self.num_seqs
-    except NotImplementedError:
-      raise NotImplementedError("%s: get_total_num_seqs with partition epoch %i" % (self, self.partition_epoch))
+    raise NotImplementedError("%s: get_total_num_seqs with partition epoch %i" % (self, self.partition_epoch))
 
   def have_corpus_seq_idx(self):
     """
@@ -972,7 +970,8 @@ class Dataset(object):
           if chunk_step[key] == chunk_step[default_key]:
             raise Exception("Chunking with multiple data-keys of different length: %r" % length)
           else:
-            limit = limit_default = 1
+            limit = 1
+            limit_default = self.min_chunk_size + 1
             if self.min_chunk_size == chunk_size[default_key]:
               limit = chunk_size[key]
               limit_default = chunk_size[default_key]
