@@ -9099,21 +9099,22 @@ class ForcedAlignmentLayer(_ConcatInputLayer):
   """
   layer_class = "forced_align"
 
-  def __init__(self, align_target, topology, input_type, blank_idx=-1, **kwargs):
+  def __init__(self, topology, input_type, align_target=None, blank_idx=-1, 
+               sprint_opts=None, **kwargs):
     """
     :param LayerBase align_target:
     :param str topology: e.g. "ctc" or "rna" (RNA is CTC without label loop)
     :param str input_type: "log_prob" or "prob"
     :param int blank_idx: vocab index of the blank symbol
+    :param dict sprint_opts: parameters passed to :func:`get_sprint_automata_for_batch_op`
     """
     from returnn.tf.native_op import get_ctc_fsa_fast_bw, fast_viterbi
     super(ForcedAlignmentLayer, self).__init__(**kwargs)
     self.align_target = align_target
-    assert topology in ["ctc", "rna"], "%s no other topology implemented" % self
+    assert topology in ["ctc", "rna", "sprint"], "%s no other topology implemented" % self
     logits_data = self.input_data.copy_as_time_major()
     logits = logits_data.placeholder
     assert logits.get_shape().ndims == 3 and logits.get_shape().dims[-1].value == logits_data.dim
-    assert align_target.output.shape == (None,) and align_target.output.dim == logits_data.dim - 1
     if blank_idx < 0:
       blank_idx += logits_data.dim
     assert 0 <= blank_idx < logits_data.dim
@@ -9124,11 +9125,20 @@ class ForcedAlignmentLayer(_ConcatInputLayer):
     else:
       raise ValueError("%s: invalid input_type %r" % (self, input_type))
 
-    edges, weights, start_end_states = get_ctc_fsa_fast_bw(
-      targets=align_target.output.get_placeholder_as_batch_major(),
-      seq_lens=align_target.output.get_sequence_lengths(),
-      blank_idx=blank_idx,
-      label_loop=topology == "ctc")
+    if topology in ["ctc", "rna"]:
+      from returnn.tf.native_op import get_ctc_fsa_fast_bw
+      assert align_target.output.shape == (None,) and align_target.output.dim == logits_data.dim - 1
+      edges, weights, start_end_states = get_ctc_fsa_fast_bw(
+        targets=align_target.output.get_placeholder_as_batch_major(),
+        seq_lens=align_target.output.get_sequence_lengths(),
+        blank_idx=blank_idx,
+        label_loop=topology == "ctc")
+    elif topology == "sprint":
+      from returnn.tf.sprint import get_sprint_automata_for_batch_op
+      seq_tags = self.network.get_seq_tags()
+      edges, weights, start_end_states = get_sprint_automata_for_batch_op(
+        sprint_opts=sprint_opts, tags=seq_tags)
+    
     alignment, scores = fast_viterbi(
       am_scores=logits, am_seq_len=logits_data.get_sequence_lengths(),
       edges=edges, weights=weights, start_end_states=start_end_states)
@@ -9173,7 +9183,8 @@ class ForcedAlignmentLayer(_ConcatInputLayer):
     :param get_layer:
     """
     super(ForcedAlignmentLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)
-    d["align_target"] = get_layer(d["align_target"])
+    if d['align_target'] != "sprint":
+      d["align_target"] = get_layer(d["align_target"])
 
   @classmethod
   def get_out_data_from_opts(cls, name, sources, **kwargs):
