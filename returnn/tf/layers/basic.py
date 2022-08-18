@@ -9331,7 +9331,7 @@ class FastBaumWelchLayer(_ConcatInputLayer):
 
   def __init__(self, align_target, align_target_key=None,
                ctc_opts=None, sprint_opts=None,
-               input_type="log_prob",
+               input_type="log_prob", tdps=None,
                tdp_scale=1.0, am_scale=1.0, min_prob=0.0,
                staircase_seq_len_source=None,
                **kwargs):
@@ -9341,6 +9341,7 @@ class FastBaumWelchLayer(_ConcatInputLayer):
     :param dict[str] ctc_opts: used for align_target "ctc"
     :param dict[str] sprint_opts: used for Sprint (RASR) for align_target "sprint"
     :param str input_type: "log_prob" or "prob"
+    :param LayerBase|None tdps: trainable transition parameters as log probs
     :param float tdp_scale:
     :param float am_scale:
     :param float min_prob: clips the minimum prob (value in [0,1])
@@ -9390,14 +9391,48 @@ class FastBaumWelchLayer(_ConcatInputLayer):
     elif align_target == "sprint":
       from returnn.tf.util.basic import sequence_mask_time_major
       seq_mask = sequence_mask_time_major(data.get_sequence_lengths())
-      from returnn.tf.native_op import fast_baum_welch_by_sprint_automata
       seq_tags = self.network.get_seq_tags()
-      fwdbwd, obs_scores = fast_baum_welch_by_sprint_automata(
-        sprint_opts=sprint_opts,
-        tdp_scale=tdp_scale,
-        am_scores=am_scores,
-        float_idx=seq_mask,
-        tags=seq_tags)
+      if tdps is None:
+        from returnn.tf.native_op import fast_baum_welch_by_sprint_automata
+        fwdbwd, obs_scores = fast_baum_welch_by_sprint_automata(
+          sprint_opts=sprint_opts,
+          tdp_scale=tdp_scale,
+          am_scores=am_scores,
+          float_idx=seq_mask,
+          tags=seq_tags)
+      else:
+        from returnn.tf.native_op import fast_baum_welch_tdps_by_sprint_automata
+        tdps_layer = tdps
+        tdps = tdps.output
+        feature_dependent = (tdps.batch_shape == data.batch_shape + (2,))
+        assert tdps.batch_shape == (am_scores.shape[-1], 2) or feature_dependent, "TDPs must have shape (dim, 2) or (time, batch, dim, 2) for fwd and loop probabilities"
+        fwdbwd, grad_tdps, obs_scores = fast_baum_welch_tdps_by_sprint_automata(
+          sprint_opts=sprint_opts,
+          tdp_scale=tdp_scale,
+          am_scores=am_scores,
+          tdps=-tdps.placeholder,
+          float_idx=seq_mask,
+          tags=seq_tags,
+          feature_dependent=feature_dependent
+        )
+        # make grad of tdps accessible as sub layer
+        name="%s/%s" % (self.name, "tdps")
+        # tdps_out = tdps.copy(name)
+        if not feature_dependent:
+          tdps_out = tdps.copy_add_batch_dim(0)
+        else:
+          tdps_out = tdps.copy()
+        tdps_out.placeholder = tf.exp(-grad_tdps)
+        tdps_out.sanity_check()
+        layer = InternalLayer(
+          name, network=self.network,
+          output=tdps_out,
+          sources=self.sources + [tdps_layer]
+        )
+        # layer.output.placeholder = tf.exp(-grad_tdps)
+        # layer.output.size_placeholder = tdps.copy_add_batch_dim(0).size_placeholder.copy()
+        layer.output_loss = obs_scores[0]
+        self._sub_layers = {"tdps": layer}
     elif align_target == "staircase":
       from returnn.tf.native_op import fast_baum_welch_staircase
       fwdbwd, obs_scores = fast_baum_welch_staircase(
@@ -9420,6 +9455,8 @@ class FastBaumWelchLayer(_ConcatInputLayer):
     super(FastBaumWelchLayer, cls).transform_config_dict(d, network=network, get_layer=get_layer)
     if d.get("staircase_seq_len_source"):
       d["staircase_seq_len_source"] = get_layer(d["staircase_seq_len_source"])
+    if d.get("tdps"):
+      d["tdps"] = get_layer(d["tdps"])
 
   @classmethod
   def get_out_data_from_opts(cls, name, sources, **kwargs):
@@ -9429,6 +9466,33 @@ class FastBaumWelchLayer(_ConcatInputLayer):
     :rtype: Data
     """
     return get_concat_sources_data_template(sources, name="%s_output" % name).copy_as_time_major()
+
+  def get_sub_layer(self, layer_name):
+    """
+    :param str layer_name
+    :rtype: LayerBase|None
+    """
+    return self._sub_layers.get(layer_name, None)
+  
+  @classmethod
+  def get_sub_layer_out_data_from_opts(cls, layer_name, parent_layer_kwargs):
+    """
+    :param str layer_name: name of the sub_layer (right part of '/' separated path)
+    :param dict[str] parent_layer_kwargs: kwargs for the parent layer (as kwargs in cls.get_out_data_from_opts())
+    :return: Data template, network and the class type of the sub-layer
+    :rtype: (Data, TFNetwork, type)|None
+    """
+    tdps_layer = parent_layer_kwargs.get("tdps", None)
+    if not tdps_layer:
+      return
+    assert isinstance(tdps_layer, LayerBase)
+    if layer_name not in {"tdps"}:
+      return None
+    name = parent_layer_kwargs.get("name", "<unknown>")
+    out = tdps_layer.output.copy(name="%s/%s_output" % (name, layer_name))
+    if not out.have_time_axis(): # not feature dependent -> add batch axis
+      out = out.copy_add_batch_dim(0)
+    return out, parent_layer_kwargs["network"], InternalLayer
 
 
 class SyntheticGradientLayer(_ConcatInputLayer):

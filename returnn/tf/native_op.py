@@ -1236,6 +1236,15 @@ def make_fast_baum_welch_op(**kwargs):
   maker = OpMaker(OpDescription.from_gen_base(native_op.FastBaumWelchOp), **kwargs)
   return maker.make_op()
 
+def make_fast_baum_welch_tdps_op(feature_dependent=False, **kwargs):
+  """
+  :return: op
+  :rtype: (tf.Tensor) -> tuple[tf.Tensor]
+  """
+  gen_base = native_op.FastBaumWelchFeatureDependentTdpsOp if feature_dependent else native_op.FastBaumWelchTdpsOp
+  maker = OpMaker(OpDescription.from_gen_base(gen_base), **kwargs)
+  return maker.make_op()
+
 
 def fast_baum_welch(am_scores, edges, weights, start_end_states, float_idx, state_buffer=None):
   """
@@ -1260,6 +1269,34 @@ def fast_baum_welch(am_scores, edges, weights, start_end_states, float_idx, stat
   fwdbwd, obs_scores = op(am_scores, edges, weights, start_end_states, float_idx, state_buffer)  # noqa
   return fwdbwd, obs_scores
 
+def fast_baum_welch_tdps(am_scores, tdps, edges, weights, start_end_states, float_idx, state_buffer=None, feature_dependent=False):
+  """
+  :param tf.Tensor am_scores: (time, batch, dim), in -log space
+  :param tf.Tensor tdps: (dim, 2), in -log space if not feature_dependent, otherwise (time, batch, dim, 2)
+  :param tf.Tensor edges: (4,num_edges), edges of the graph (from,to,emission_idx,sequence_idx)
+  :param tf.Tensor weights: (num_edges,), weights of the edges
+  :param tf.Tensor start_end_states: (2, batch), (start,end) state idx in automaton. there is only one single automaton.
+  :param tf.Tensor float_idx: (time, batch) -> 0 or 1 (index mask, via seq lens)
+  :param tf.Tensor state_buffer: (2, num_states)
+  :return: (fwdbwd, grad_tdps, obs_scores), fwdbwd is (time, batch, dim),
+    grad_tdps is (time, batch, dim, 2) if feature dependent, otherwise (batch, dim, 2),
+    obs_scores is (time, batch), in -log space
+  :rtype: (tf.Tensor, tf.Tensor)
+  """
+  # edges, weights, start_end_states, state_buffer = SprintAlignmentAutomataOp(self.sprint_opts)(self.network.tags)
+  op = make_fast_baum_welch_tdps_op(feature_dependent)
+  float_idx = tf.cast(float_idx, tf.float32)
+  if state_buffer is None:
+    last_state_idx = tf.reduce_max(start_end_states[1])  # see get_automata_for_batch
+    with tf.control_dependencies([
+        tf_compat.v1.assert_greater_equal(
+          last_state_idx, 0, data=["last_state_idx must be >= 0 but is:", last_state_idx])]):
+      state_buffer = tf.zeros((2, last_state_idx + 1))
+    state_buffer = tf.zeros((2, last_state_idx + 1))
+  fwdbwd, grad_tdps, obs_scores = op(am_scores, tdps, edges, weights, start_end_states, float_idx, state_buffer)  # noqa
+  return fwdbwd, grad_tdps, obs_scores
+
+
 
 def fast_baum_welch_by_sprint_automata(am_scores, float_idx, tags, sprint_opts, tdp_scale=1.0):
   """
@@ -1281,6 +1318,32 @@ def fast_baum_welch_by_sprint_automata(am_scores, float_idx, tags, sprint_opts, 
   return fast_baum_welch(
     am_scores=am_scores, float_idx=float_idx,
     edges=edges, weights=weights, start_end_states=start_end_states)
+
+def fast_baum_welch_tdps_by_sprint_automata(am_scores, tdps, float_idx, tags, sprint_opts, tdp_scale=1.0, feature_dependent=False):
+  """
+  :param tf.Tensor am_scores: (time, batch, dim), in -log space
+  :param tf.Tensor tdps: (dim, 2), in -log space
+  :param tf.Tensor float_idx: (time, batch) -> 0 or 1 (index mask, via seq lens)
+  :param tf.Tensor tags: (batch,) -> seq name (str)
+  :param float tdp_scale: weights are multiplied by this
+  :param dict[str] sprint_opts:
+  :return: (fwdbwd, tdp_grad, obs_scores), fwdbwd is (time, batch, dim),
+    tdp_grad is (dim, 2)
+    obs_scores is (time, batch), in -log space
+  :rtype: (tf.Tensor, tf.Tensor)
+  """
+  from returnn.tf.sprint import get_sprint_automata_for_batch_op
+  edges, weights, start_end_states = get_sprint_automata_for_batch_op(sprint_opts=sprint_opts, tags=tags)
+  if tdp_scale != 1:
+    if tdp_scale == 0:
+      tdps = tf.zeros_like(tdps)
+    else:
+      tdps *= tdp_scale
+  return fast_baum_welch_tdps(
+    am_scores=am_scores, tdps=tdps, float_idx=float_idx,
+    edges=edges, weights=weights, start_end_states=start_end_states,
+    feature_dependent=feature_dependent
+  )
 
 
 def tf_fast_bw_fsa_staircase(seq_lens, **opts):
