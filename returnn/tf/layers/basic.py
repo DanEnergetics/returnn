@@ -1799,7 +1799,7 @@ class LinearLayer(_ConcatInputLayer):
     :param float|None grad_filter: if grad norm is higher than this threshold (before activation), the grad is removed
     :param str forward_weights_init: see :func:`returnn.tf.util.basic.get_initializer`
     :param str recurrent_weights_init: see :func:`returnn.tf.util.basic.get_initializer`
-    :param str|float bias_init: see :func:`returnn.tf.util.basic.get_initializer`
+    :param str|float|numpy.ndarray bias_init: see :func:`returnn.tf.util.basic.get_initializer`
     :param bool use_transposed_weights: If True, define the weight matrix with transposed dimensions (n_out, n_in).
     """
     super(LinearLayer, self).__init__(**kwargs)
@@ -1839,7 +1839,7 @@ class LinearLayer(_ConcatInputLayer):
 
       if self.with_bias:
         bias_initializer = get_initializer(
-          bias_init, seed=self.network.random.randint(2 ** 31) if bias_init else 0, eval_local_ns={"layer": self})
+          bias_init, seed=self.network.random.randint(2 ** 31), eval_local_ns={"layer": self})
         b = self.add_param(tf_compat.v1.get_variable(
           name="b", shape=(n_out,), dtype=tf.float32, initializer=bias_initializer))
       else:
