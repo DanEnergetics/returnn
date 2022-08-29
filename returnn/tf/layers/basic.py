@@ -10999,7 +10999,7 @@ class ViaLayerLoss(Loss):
       else:
         assert self.align_layer
         error_signal = self.output.placeholder - self.align_layer.output.copy_compatible_to(self.output).placeholder
-      if self.output.is_time_axis_dynamic():
+      if self.output.have_time_axis() and self.output.is_time_axis_dynamic():
         seq_mask_bc = self.output.get_sequence_mask_broadcast()
         error_signal = where_bc(seq_mask_bc, error_signal, 0.0)
       if self.loss_wrt_to_act_in:
