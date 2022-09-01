@@ -199,6 +199,10 @@ class ExtractAudioFeatures:
         feature_data = _get_audio_db_mel_filterbank(**kwargs)
       elif self.features == "linear_spectrogram":
         feature_data = _get_audio_linear_spectrogram(**kwargs)
+      elif self.features == "f0":
+        kwargs.pop("num_feature_filters")
+        kwargs.pop("window_len")
+        feature_data = _get_f0_values(**kwargs)
       else:
         raise Exception("non-supported feature type %r" % (self.features,))
 
@@ -265,7 +269,8 @@ class ExtractAudioFeatures:
     return (self.with_delta + 1) * self.num_feature_filters * (self.join_frames or 1)
 
 
-def _get_audio_linear_spectrogram(audio, sample_rate, window_len=0.025, step_len=0.010, num_feature_filters=512):
+def _get_audio_linear_spectrogram(audio, sample_rate, window_len=0.025, step_len=0.010, num_feature_filters=512,
+                                  center=True):
   """
   Computes linear spectrogram features from an audio signal.
   Drops the DC component.
@@ -274,6 +279,7 @@ def _get_audio_linear_spectrogram(audio, sample_rate, window_len=0.025, step_len
   :param int sample_rate: e.g. 22050
   :param float window_len: in seconds
   :param float step_len: in seconds
+  :param bool center: pads the signal with reflection so that the window center starts at 0.
   :return: (audio_len // int(step_len * sample_rate), num_feature_filters), float32
   :rtype: numpy.ndarray
   """
@@ -290,7 +296,7 @@ def _get_audio_linear_spectrogram(audio, sample_rate, window_len=0.025, step_len
     stft_func = librosa.core.stft
   spectrogram = numpy.abs(stft_func(
     audio, hop_length=int(step_len * sample_rate),
-    win_length=int(window_len * sample_rate), n_fft=num_feature_filters*2))
+    win_length=int(window_len * sample_rate), n_fft=num_feature_filters*2, center=center))
 
   # remove the DC part
   spectrogram = spectrogram[1:]
@@ -301,7 +307,7 @@ def _get_audio_linear_spectrogram(audio, sample_rate, window_len=0.025, step_len
 
 
 def _get_audio_features_mfcc(audio, sample_rate, window_len=0.025, step_len=0.010, num_feature_filters=40,
-                             n_mels=128, fmin=0, fmax=None):
+                             n_mels=128, fmin=0, fmax=None, center=True):
   """
   :param numpy.ndarray audio: raw audio samples, shape (audio_len,)
   :param int sample_rate: e.g. 22050
@@ -311,6 +317,7 @@ def _get_audio_features_mfcc(audio, sample_rate, window_len=0.025, step_len=0.01
   :param int n_mels: number of mel filters
   :param int fmin: minimum frequency for mel filters
   :param int|None fmax: maximum frequency for mel filters (None -> use sample_rate/2)
+  :param bool center: pads the signal with reflection so that the window center starts at 0.
   :return: (audio_len // int(step_len * sample_rate), num_feature_filters), float32
   :rtype: numpy.ndarray
   """
@@ -319,7 +326,8 @@ def _get_audio_features_mfcc(audio, sample_rate, window_len=0.025, step_len=0.01
     y=audio, sr=sample_rate,
     n_mfcc=num_feature_filters,
     n_mels=n_mels, fmin=fmin, fmax=fmax,
-    hop_length=int(step_len * sample_rate), n_fft=int(window_len * sample_rate))
+    hop_length=int(step_len * sample_rate), n_fft=int(window_len * sample_rate),
+    center=center)
   librosa_version = librosa.__version__.split(".")
   if int(librosa_version[0]) >= 1 or (int(librosa_version[0]) == 0 and int(librosa_version[1]) >= 7):
     rms_func = librosa.feature.rms
@@ -467,3 +475,24 @@ def _get_random_permuted_audio(audio, sample_rate, opts, random_state):
     audio = librosa.effects.pitch_shift(audio, sr=sample_rate, n_steps=n_steps)
   opts.assert_all_read()
   return audio
+
+
+def _get_f0_values(audio, sample_rate, step_len=0.010, fmin=0, fmax=None):
+  """
+  Calls pyworld dio and stonemask to retrieve f_0 values and replaces all NaN positions(silence) with 0
+  Does not use librosa.pyin because it is a lot slower.
+
+  :param numpy.ndarray audio: raw time signal
+  :param int sample_rate: e.g. 22050
+  :param float step_len: in seconds
+  :param int fmin: minimum frequency covered by mel filters
+  :param int|None fmax: maximum frequency covered by mel filters
+  :rtype: numpy.ndarray
+  :return: Pitch features for audio signal
+  """
+  import pyworld as pw  # noqa
+  f_0, t = pw.dio(x=audio, fs=sample_rate, f0_floor=fmin, f0_ceil=fmax, frame_period=step_len * 1000)  # convert to ms
+  f_0 = pw.stonemask(x=audio, f0=f_0, temporal_positions=t, fs=sample_rate)
+  f_0 = numpy.nan_to_num(f_0, nan=0.0)
+  f_0 = numpy.expand_dims(f_0, axis=1)   # (time, dim)
+  return f_0

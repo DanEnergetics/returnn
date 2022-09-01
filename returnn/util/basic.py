@@ -645,7 +645,7 @@ def terminal_size(file=sys.stdout):
   try:
     if not os.isatty(file.fileno()):
       return -1, -1
-  except io.UnsupportedOperation:
+  except (io.UnsupportedOperation, ValueError):
     return -1, -1
   env = os.environ
 
@@ -863,7 +863,7 @@ def progress_bar(complete=1.0, prefix="", suffix="", file=None):
   if file is None:
     file = sys.stdout
   terminal_width, _ = terminal_size(file=file)
-  if terminal_width == -1:
+  if terminal_width <= 0:
     return
   if complete == 1.0:
     file.write("\r%s" % (terminal_width * ' '))

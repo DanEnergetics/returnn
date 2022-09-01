@@ -1486,6 +1486,44 @@ def test_RangeFromLength_over_batch():
     assert list(out_v) == list(range(n_batch))
 
 
+def test_RangeInAxisLayer():
+  net_dict = {
+    "output": {'class': 'range_in_axis', 'from': 'data', 'axis': 'T'},
+  }
+  with make_scope() as session:
+    config = Config({"extern_data": {"data": {"dim": 3}}})
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    in_ = net.extern_data.get_default_input_data()
+    out = net.get_default_output_layer().output
+    assert out.get_time_dim_tag() == in_.get_time_dim_tag()
+    in_v, out_v = session.run((in_.placeholder, out.placeholder), feed_dict=make_feed_dict(net.extern_data))
+    n_batch, n_time, n_feat = in_v.shape
+    assert out_v.shape == (n_time,)
+    assert list(out_v) == list(range(n_time))
+
+
+def test_RangeInAxisLayer_generic_dim():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+  time_dim = SpatialDim("time")
+  out_time_dim = time_dim + 2
+  feat_dim = FeatureDim("feat", 3)
+  config = Config({"extern_data": {"data": {"dim_tags": [batch_dim, time_dim, feat_dim]}}})
+  net_dict = {
+    "output": {'class': 'range_in_axis', 'from': 'data', 'axis': out_time_dim},
+  }
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    in_ = net.extern_data.get_default_input_data()
+    out = net.get_default_output_layer().output
+    assert in_.get_time_dim_tag() == time_dim != out_time_dim == out.get_time_dim_tag()
+    in_v, out_v = session.run((in_.placeholder, out.placeholder), feed_dict=make_feed_dict(net.extern_data))
+    n_batch, n_time, n_feat = in_v.shape
+    assert out_v.shape == (n_time + 2,)
+    assert list(out_v) == list(range(n_time + 2))
+
+
 def test_SwitchLayer_sanity_check():
   """
   https://github.com/rwth-i6/returnn/issues/800
@@ -1810,6 +1848,81 @@ def test_ReduceLayer_reduce4d():
   out = ReduceLayer.get_out_data_from_opts(**opts)
   layer = ReduceLayer(output=out, **opts)
   print("layer:", layer)
+
+
+def test_reduce_repeat_1102():
+  # https://github.com/rwth-i6/returnn/issues/1102
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+
+  time_dim = SpatialDim('time')
+  F_dim = FeatureDim('F', 1)
+  speech_dim = SpatialDim('speech')
+  speech_feat_dim = FeatureDim('speech-feat', 3)
+
+  config = Config(dict(extern_data={
+    'emb': {
+      'dim_tags': (batch_dim, time_dim, F_dim),
+      'dtype': 'float32',
+      'available_for_inference': True
+    },
+    'durations': {
+      'dim_tags': (batch_dim, time_dim),
+      'dtype': 'int32',
+      'available_for_inference': True
+    },
+    'target_speech': {
+      'dim_tags': (batch_dim, speech_dim, speech_feat_dim),
+      'dtype': 'float32',
+      'available_for_inference': True
+    }
+  }))
+
+  net_dict = {
+    'nartts_model_reduce': {
+      'class': 'copy',
+      'from': 'reduce',
+      'loss': 'as_is',
+      'out_shape': {batch_dim, speech_feat_dim}
+    },
+    'output': {
+      'class': 'copy',
+      'from': 'repeat',
+      'out_shape': {batch_dim, F_dim, speech_dim}
+    },
+    'reduce': {
+      'class': 'reduce',
+      'from': 'data:target_speech',
+      'mode': 'mean',
+      'axis': speech_dim,
+      'out_shape': {batch_dim, speech_feat_dim}
+    },
+    'repeat': {
+      'class': 'repeat',
+      'from': 'data:emb',
+      'repetitions': 'data:durations',
+      'axis': time_dim,
+      'out_dim': speech_dim,
+      'out_shape': {batch_dim, F_dim, speech_dim}
+    }
+  }
+
+  with make_scope() as session:
+    net = TFNetwork(config=config, eval_flag=True)
+    net.construct_from_dict(net_dict)
+
+    d = net.extern_data.data
+    feed_dict = {
+      d["emb"].placeholder: [[[1.], [2.], [0.]]],
+      d["emb"].size_placeholder[0]: [3],
+      d["durations"].placeholder: [[1, 2, 1]],
+      d["target_speech"].placeholder: [[[1., 2., 3.], [4., 5., 6.], [1., 2., 3.], [1., 2., 3.]]],
+      d["target_speech"].size_placeholder[0]: [4],
+    }
+    # TODO ERROR this is not extern_data/placeholders/target_speech/target_speech_dim0_size
+    #   but Tensor("repeat/Sum:0", shape=(?,), dtype=int32)
+    print(d["target_speech"].size_placeholder[0])
+    fetches = net.get_fetches_dict()
+    session.run(fetches, feed_dict=feed_dict)
 
 
 def test_SoftmaxOverSpatialLayer_start():
@@ -4490,6 +4603,83 @@ def test_CondLayer_subnet_template_construct():
     assert _EvalFuncLocals.session_call_count == 1
 
 
+def test_CondLayer_data_access():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+
+  time_dim = SpatialDim('time')
+  input_dim = FeatureDim('input', 13)
+
+  config = Config(dict(extern_data={
+    'data': {'dim_tags': (batch_dim, time_dim, input_dim)}
+  }))
+  net_dict = {
+    'output': {
+      'class': 'copy',
+      'from': 'cond',
+      'out_shape': {batch_dim, time_dim, input_dim}
+    },
+    'length': {
+      'class': 'length',
+      'from': 'data:data',
+      'axis': batch_dim,
+      'out_shape': {}
+    },
+    'mod': {
+      'class': 'eval',
+      'from': 'length',
+      'eval': 'source(0) % 2',
+      'out_shape': {}
+    },
+    'eq': {
+      'class': 'compare',
+      'from': 'mod',
+      'kind': 'equal',
+      'value': 0,
+      'out_shape': {}
+    },
+    'cond': {
+      'class': 'cond',
+      'from': [],
+      'condition': 'eq',
+      'true_layer': {
+        'class': 'subnetwork',
+        'from': [],
+        'subnetwork': {
+          'const': {
+            "class": "constant", "value": 1.,
+            'shape': (batch_dim, time_dim, input_dim),
+            'shape_deps': ['base:data:data']
+          },
+          'output': {
+            'class': 'combine',
+            'from': ['base:data:data', 'const'],
+            'kind': 'add',
+            'out_shape': {batch_dim, time_dim, input_dim}
+          },
+        }
+      },
+      'false_layer': {
+        'class': 'subnetwork',
+        'from': [],
+        'subnetwork': {
+          'output': {
+            'class': 'copy',
+            'from': 'base:data:data',
+            'out_shape': {batch_dim, time_dim, input_dim}
+          }
+        }
+      },
+      'out_shape': {batch_dim, time_dim, input_dim},
+      'name_scope': ''
+    },
+  }
+  with make_scope() as session:
+    network = TFNetwork(config=config, train_flag=True)
+    network.construct_from_dict(net_dict)
+    network.initialize_params(session)
+    session.run(network.get_default_output_layer().output.placeholder, feed_dict=make_feed_dict(network.extern_data))
+
+
 def test_ScatterNdLayer_RangeLayer():
   from returnn.tf.util.data import batch_dim, Dim
   n_batch, n_time, n_ts, n_out = 2, 3, 6, 11
@@ -4785,6 +4975,23 @@ def test_ConvLayer_get_valid_out_dim():
   assert_equal(ConvLayer.calc_out_dim(in_dim=2, stride=1, filter_size=3, padding="valid"), 0)
 
 
+def test_LengthLayer():
+  net_dict = {
+    "output": {"class": "length", "from": "data", "axis": "T"},
+  }
+  with make_scope() as session:
+    config = Config({"extern_data": {"data": {"dim": 10}}})
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    in_ = net.extern_data.get_default_input_data()
+    out = net.get_default_output_layer().output
+    in_v, in_size_v, out_v = session.run(
+      (in_.placeholder, in_.size_placeholder[0], out.placeholder), feed_dict=make_feed_dict(net.extern_data))
+    n_batch, n_time, n_feat = in_v.shape
+    assert out_v.shape == in_size_v.shape == (n_batch,)
+    assert list(out_v) == list(in_size_v)
+
+
 def test_LengthLayer_batch():
   net_dict = {
     "input_flat": {"class": "flatten_batch", "from": "data"},  # [B_T,F]
@@ -4804,6 +5011,27 @@ def test_LengthLayer_batch():
     assert in_lens_v.shape == (in_shape_v[0],)
     assert max(in_lens_v) == in_shape_v[1]
     assert sum(in_lens_v) == flat_shape_v[0] == out_v
+
+
+def test_LengthLayer_generic_dim():
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+  time_dim = SpatialDim("time")
+  out_time_dim = time_dim + 2
+  feat_dim = FeatureDim("feat", 3)
+  config = Config({"extern_data": {"data": {"dim_tags": [batch_dim, time_dim, feat_dim]}}})
+  net_dict = {
+    "output": {"class": "length", "from": "data", "axis": out_time_dim},
+  }
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    in_ = net.extern_data.get_default_input_data()
+    out = net.get_default_output_layer().output
+    in_v, in_size_v, out_v = session.run(
+      (in_.placeholder, in_.size_placeholder[0], out.placeholder), feed_dict=make_feed_dict(net.extern_data))
+    n_batch, n_time, n_feat = in_v.shape
+    assert out_v.shape == in_size_v.shape == (n_batch,)
+    assert list(out_v) == list(in_size_v + 2)
 
 
 def test_RandIntLayer():
@@ -4860,6 +5088,67 @@ def test_rand_indices():
       feed_dict=make_feed_dict(net.extern_data, n_batch=n_batch, n_time=n_time))
     assert_equal(indices_flat.shape, (n_batch, n_time, sz[-1].dimension))
     assert_equal(output.shape, (n_batch, n_time, sz[-1].dimension, feature_dim.dimension))
+
+
+def test_RandomLayer():
+  # https://github.com/rwth-i6/returnn_common/issues/197
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+  time_dim = SpatialDim('time')
+  input_dim = FeatureDim('input', 3)
+  config = Config({"extern_data": {"data": {"dim_tags": (batch_dim, time_dim, input_dim)}}})
+  net_dict = {
+    'random': {
+      'class': 'random',
+      'shape': [batch_dim, input_dim],
+      'distribution': 'normal',
+      'mean': 0.0,
+      'stddev': 1.0,
+    },
+    'output': {
+      'class': 'combine', "kind": "add",
+      'from': ["data:data", 'random'],
+      'out_shape': {batch_dim, time_dim, input_dim}
+    }
+  }
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    net.initialize_params(session)
+    out = net.get_default_output_layer().output.copy_as_time_major()
+    out_np = session.run(out.placeholder, feed_dict=make_feed_dict(net.extern_data))
+    print(out_np)
+
+
+def test_RandomLayer_shape_deps():
+  # https://github.com/rwth-i6/returnn_common/issues/197
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+  time_dim = SpatialDim('time')
+  time_pool_dim = SpatialDim("time-pool")
+  input_dim = FeatureDim('input', 3)
+  config = Config({"extern_data": {"data": {"dim_tags": (batch_dim, time_dim, input_dim)}}})
+  net_dict = {
+    'pool': {"class": "pool", "pool_size": [2], "mode": "max", "from": "data", "out_spatial_dims": [time_pool_dim]},
+    'random': {
+      'class': 'random',
+      'shape': [batch_dim, time_pool_dim, input_dim],
+      "shape_deps": ["pool"],
+      'distribution': 'normal',
+      'mean': 0.0,
+      'stddev': 1.0,
+    },
+    'output': {
+      'class': 'combine', "kind": "add",
+      'from': ['random', 'pool'],  # the order is relevant to test shape_deps
+      'out_shape': {batch_dim, time_pool_dim, input_dim}
+    }
+  }
+  with make_scope() as session:
+    net = TFNetwork(config=config)
+    net.construct_from_dict(net_dict)
+    net.initialize_params(session)
+    out = net.get_default_output_layer().output.copy_as_time_major()
+    out_np = session.run(out.placeholder, feed_dict=make_feed_dict(net.extern_data))
+    print(out_np)
 
 
 def test_RandomLayer_in_loop():
@@ -5664,6 +5953,24 @@ def test_SliceNdLayer_set_tag_on_size_tensor():
     })
 
 
+def test_SliceNdLayer_start0():
+  with make_scope() as session:
+    from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+    time_dim = SpatialDim("time")
+    feature_dim = FeatureDim("feature", 5)
+    config = Config({"extern_data": {"data": {"dim_tags": (batch_dim, time_dim, feature_dim)}}})
+    net = TFNetwork(config=config, train_flag=True)
+    # the construction of the "compare" layer will fail if set_tag_on_size_tensor is not called on the slice axis
+    # inside of the SliceNdLayer
+    net.construct_from_dict({
+      "downsample": {"class": "pool", "mode": "avg", "pool_size": 2, "from": "data"},
+      "upsample": {"class": "resize", "axis": "T", "factor": 2, "from": "downsample"},
+      "cutoff": {"class": "slice_nd", "from": "data", "size": time_dim},
+      "output": {"class": "combine", "from": ["cutoff", "data"], "kind": "sub"}
+    })
+    session.run(net.get_default_output_layer().output.placeholder, feed_dict=make_feed_dict(net.extern_data))
+
+
 def test_SliceNdLayer_ReinterpretDataLayer():
   """
   https://github.com/rwth-i6/returnn/issues/851
@@ -6283,6 +6590,44 @@ def test_TransposedConvLayer_2d_2x2():
     out_v = session.run(out.placeholder, feed_dict={net.extern_data.data["data"].placeholder: in_v})
     assert isinstance(out_v, numpy.ndarray)
     assert out_v.shape == (n_batch, n_out, n_time * 2, 2)
+
+
+def test_TransposedConvLayer_out_size_pool_pad_same():
+  with make_scope() as session:
+    from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+    time_dim = SpatialDim("time")
+    feature_dim = FeatureDim("feature", 5)
+    config = Config({"extern_data": {"data": {"dim_tags": (batch_dim, time_dim, feature_dim)}}})
+    net = TFNetwork(config=config, train_flag=True)
+    net.construct_from_dict({
+      "downsample": {
+        "class": "pool", "mode": "avg", "pool_size": [2], "from": "data", "padding": "same"},  # ceildiv with same
+      "upsample": {
+        "class": "transposed_conv", "filter_size": [2], "from": "downsample", "padding": "same",
+        "out_spatial_dims": [time_dim], "out_dim": feature_dim},
+      "output": {"class": "combine", "from": ["upsample", "data"], "kind": "sub"}
+    })
+    net.initialize_params(session)
+    session.run(net.get_default_output_layer().output.placeholder, feed_dict=make_feed_dict(net.extern_data))
+
+
+def test_TransposedConvLayer_out_size_pool_pad_valid():
+  with make_scope() as session:
+    from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+    time_dim = SpatialDim("time")
+    feature_dim = FeatureDim("feature", 5)
+    config = Config({"extern_data": {"data": {"dim_tags": (batch_dim, time_dim, feature_dim)}}})
+    net = TFNetwork(config=config, train_flag=True)
+    net.construct_from_dict({
+      "downsample": {
+        "class": "pool", "mode": "avg", "pool_size": [2], "from": "data", "padding": "valid"},  # floordiv with valid
+      "upsample": {
+        "class": "transposed_conv", "filter_size": [2], "from": "downsample", "padding": "valid",
+        "out_spatial_dims": [time_dim], "out_dim": feature_dim},
+      "output": {"class": "combine", "from": ["upsample", "data"], "kind": "sub"}
+    })
+    net.initialize_params(session)
+    session.run(net.get_default_output_layer().output.placeholder, feed_dict=make_feed_dict(net.extern_data))
 
 
 def test_ReduceLayer_NCHW():
@@ -7297,6 +7642,48 @@ def test_double_flatten_loss():
     'repeat': {
       'class': 'repeat',
       'from': 'sub',
+      'repetitions': 5,
+      'axis': time_dim,
+      'out_dim': _repeat_out_dim,
+      'out_shape': {batch_dim, feature_dim, _repeat_out_dim}
+    },
+    'sub_0': {
+      'class': 'combine',
+      'from': ['repeat', 'repeat'],
+      'kind': 'sub',
+      'loss': 'as_is',
+      'out_shape': {batch_dim, feature_dim, _repeat_out_dim}
+    },
+    'output': {
+      'class': 'copy',
+      'from': 'sub_0',
+      'out_shape': {batch_dim, feature_dim, _repeat_out_dim}
+    }
+  }
+  with make_scope():
+    net = TFNetwork(config=config, train_flag=True)
+    net.construct_from_dict(network)
+    net.get_total_loss()
+
+
+def test_double_flatten_loss_1079():
+  # https://github.com/rwth-i6/returnn/issues/1079
+  from returnn.tf.util.data import batch_dim, SpatialDim, FeatureDim
+  time_dim = SpatialDim("time")
+  _repeat_out_dim = time_dim * 5
+  feature_dim = FeatureDim("feat", 1)
+  config = Config({"extern_data": {"data": {"dim_tags": (batch_dim, time_dim, feature_dim), "dtype": "int32"}}})
+  network = {
+    'sub': {
+      'class': 'combine',
+      'from': ['data:data', 'data:data'],
+      'kind': 'sub',
+      'loss': 'as_is',
+      'out_shape': {batch_dim, time_dim, feature_dim}
+    },
+    'repeat': {
+      'class': 'repeat',
+      'from': 'data:data',
       'repetitions': 5,
       'axis': time_dim,
       'out_dim': _repeat_out_dim,

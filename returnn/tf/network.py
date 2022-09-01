@@ -314,15 +314,18 @@ class ExternData(object):
       dict(allow_same_feature_dim=allow_same_feature_dim))
     return tags
 
-  def get_batch_info(self):
+  def get_batch_info(self, allow_none=False):
     """
-    :rtype: returnn.tf.util.data.BatchInfo
+    :param bool allow_none:
+    :rtype: returnn.tf.util.data.BatchInfo|None
     """
     for key, data in self.get_sorted_data_items():
       assert isinstance(data, Data)
-      if data.available_for_inference:
+      if data.available_for_inference and data.have_batch_axis():
         assert data.batch
         return data.batch.get_global_base()
+    if allow_none:
+      return None
     raise Exception("We cannot tell the batch dim.")
 
 
@@ -661,6 +664,8 @@ class TFNetwork(object):
 
   def _get_extra_net(self, search_flag=None, net_name=None, prefix_name=None, auto_create=True, boundary=False):
     """
+    See :func:`construct_extra_net` and :func:`make_extra_net`.
+
     :param bool|None search_flag:
     :param str|None net_name:
     :param str|None prefix_name: e.g. "extra.search" or "extra.WhateverYouWant" or just "extra"
@@ -701,6 +706,13 @@ class TFNetwork(object):
 
   def make_extra_net(self, prefix_name, net_name=None, only_template=False, boundary=False):
     """
+    See :func:`construct_extra_net`.
+
+    With boundary=False, it is accessible from outside via the "extra...:" layer name prefix,
+      and registered in main_net.extra_nets.
+    With boundary=True, it is not accessible from outside,
+      and not registered in main_net.extra_nets.
+
     :param str prefix_name: "extra.Whatever"
     :param str|None net_name:
     :param bool only_template:
@@ -728,6 +740,7 @@ class TFNetwork(object):
     That `extra_net` can have different losses, which will be added.
     Layers in ``layer_list`` will be explicitly re-created in the extra net.
     Other layers are taken from ``self``.
+    An extra net is like an overlay over the main net.
 
     The creation of the extra net and layers in the extra net can be triggered explicitly
     by referring to another layer as e.g. ``"extra.search:layer"``.
@@ -1114,6 +1127,11 @@ class TFNetwork(object):
       the layer_class will usually then define the layer.output and its placeholder.
       there is one notable exception: the InternalLayer, where you predefine the output.
     """
+    if self._extra_layer_name_prefix_pattern.match(name) and self.extra_parent_net:
+      if name.startswith(self.extra_name_prefix):
+        # We are already in the right extra net. Stay here.
+        # In case this extra net is with boundary=True, this is important, as we can not access it from outside.
+        prefix, name = name.split(":", 1)
     if self._extra_layer_name_prefix_pattern.match(name):
       prefix, name_ = name.split(":", 1)
       extra_net, _ = (self.extra_parent_net or self)._get_extra_net(prefix_name=prefix)
@@ -1314,6 +1332,7 @@ class TFNetwork(object):
     from .util.data import BatchInfo
     from .layers.basic import SourceLayer, InternalLayer, SubnetworkLayer, CopyLayer, FlattenBatchLayer
     from tensorflow.python.util import nest
+    from pprint import pformat
 
     def _relevant_dims_for_layer(layer_):
       """
@@ -1407,6 +1426,8 @@ class TFNetwork(object):
         return False
       if isinstance(layer_, (SourceLayer, InternalLayer)):
         return False
+      if layer_.layer_class in {"random", "rand_int", "constant"}:  # fixed shape
+        return False
       if not _should_flatten_layer_output(layer_):
         return False
       return True
@@ -1416,6 +1437,7 @@ class TFNetwork(object):
       Checks whether the inputs to the layer should be flattened aswell
 
       :param LayerBase layer_:
+      :return: False when we should stop here
       :rtype: bool
       """
       if not _check_push_flattening_to_inputs_for_layer_simple(layer_):
@@ -1436,6 +1458,7 @@ class TFNetwork(object):
         for dep_ in deps)
       if not valid_deps:
         return False
+      have_any_deps_which_needs_flattening = False
       for dep_ in deps:
         if dep_.output.beam:
           return False
@@ -1443,7 +1466,8 @@ class TFNetwork(object):
           if any(d.dimension is None for d in set(dep_.output.dim_tags).difference(dims)):  # any other dynamic?
             return False
           layer_queue.append(dep_)
-      return True
+          have_any_deps_which_needs_flattening = True
+      return have_any_deps_which_needs_flattening
 
     def _resolve_layer(layer_):
       """
@@ -1563,7 +1587,9 @@ class TFNetwork(object):
 
     # All end points must be mapped now.
     for layer in end_points:
-      assert layer in mapped_layers
+      assert layer in mapped_layers, (
+        "end point %r not mapped.\n end points:\n%s\n mapped:\n%s\n blacklist:\n%s\n starting points:\n%s" % (
+          layer, pformat(end_points), pformat(mapped_layers), pformat(blacklist), pformat(starting_points)))
     # Assign flatten_with_seq_len_mask cache to mapped layers.
     for layer, new_layer in mapped_layers.items():
       if not _should_flatten_layer_output(layer):
@@ -2501,7 +2527,7 @@ class TFNetwork(object):
     :rtype: returnn.tf.util.data.BatchInfo
     """
     root = self.get_root_network()
-    if root.extern_data.data:
+    if root.extern_data.get_batch_info(allow_none=True):
       return root.extern_data.get_batch_info()
     # This is an unusual case where we have no extern data at all.
     # Some test cases might have this though, and in principle we could allow it.
