@@ -9403,7 +9403,7 @@ class FastBaumWelchLayer(_ConcatInputLayer):
       else:
         from returnn.tf.native_op import fast_baum_welch_tdps_by_sprint_automata
         tdps_layer = tdps
-        tdps = tdps.output
+        tdps = tdps.output.copy_as_time_major() if tdps.output.have_time_axis() else tdps.output
         feature_dependent = (tdps.batch_shape == data.batch_shape + (2,))
         assert tdps.batch_shape == (am_scores.shape[-1], 2) or feature_dependent, "TDPs must have shape (dim, 2) or (time, batch, dim, 2) for fwd and loop probabilities"
         fwdbwd, grad_tdps, obs_scores = fast_baum_welch_tdps_by_sprint_automata(
