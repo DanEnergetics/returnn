@@ -25,6 +25,7 @@ def main():
   arg_parser.add_argument("--model", help="model filenames")
   arg_parser.add_argument("--scores", help="learning_rate_control file, e.g. newbob.data")
   arg_parser.add_argument("--dry_run", action="store_true")
+  arg_parser.add_argument("--skip_confirm", action="store_false", dest="confirm", help="don't ask for confirmation")
   args = arg_parser.parse_args()
   return_code = 0
   try:
@@ -44,7 +45,7 @@ def main():
       config.set("learning_rate_file", args.scores)
     if args.dry_run:
       config.set("dry_run", True)
-    engine.cleanup_old_models(ask_for_confirmation=True)
+    engine.cleanup_old_models(ask_for_confirmation=args.confirm)
 
   except KeyboardInterrupt:
     return_code = 1
