@@ -130,7 +130,7 @@ class SprintSubprocessInstance:
 
     def _start_child(self):
         assert self.child_pid is None
-        self.pipe_c2p = self._pipe_open()
+        self.pipe_c2p = self._pipe_open(buffered=True)
         self.pipe_p2c = self._pipe_open()
         args = self._build_sprint_args()
         print("SprintSubprocessInstance: exec", args, file=log.v5)
@@ -169,14 +169,14 @@ class SprintSubprocessInstance:
             raise Exception("SprintSubprocessInstance Sprint init failed")
 
     # noinspection PyMethodMayBeStatic
-    def _pipe_open(self):
+    def _pipe_open(self, buffered=False):
         readend, writeend = os.pipe()
         if hasattr(os, "set_inheritable"):
             # https://www.python.org/dev/peps/pep-0446/
             os.set_inheritable(readend, True)
             os.set_inheritable(writeend, True)
-        readend = os.fdopen(readend, "rb", 0)
-        writeend = os.fdopen(writeend, "wb", 0)
+        readend = os.fdopen(readend, "rb", -bool(buffered)) # -1 is default for buffered
+        writeend = os.fdopen(writeend, "wb", -bool(buffered))
         return readend, writeend
 
     @property
